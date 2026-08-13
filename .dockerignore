@@ -1,0 +1,10 @@
+.git
+.github
+.codebase-memory
+.superpowers
+.worktrees
+build
+target
+*.db
+*.db-shm
+*.db-wal

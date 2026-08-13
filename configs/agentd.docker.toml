@@ -1,0 +1,15 @@
+# Generic local Docker configuration. The published port should remain bound
+# to host loopback unless this development token is replaced with a real one.
+rest_addr = "0.0.0.0:8080"
+database_path = "/var/lib/agentd/agentd.db"
+scheduler_tick_ms = 1000
+run_concurrency = 4
+dispatch_poll_interval_ms = 250
+http_timeout_secs = 90
+api_token = "local-dev-token"
+
+# Docker Desktop resolves this host name automatically. On Linux, add
+# `--add-host=host.docker.internal:host-gateway` to `docker run`.
+llm_api_base = "http://host.docker.internal:8000/v1"
+llm_api_key = ""
+llm_model = "local/chat"

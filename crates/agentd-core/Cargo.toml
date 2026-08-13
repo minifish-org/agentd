@@ -1,0 +1,29 @@
+[package]
+name = "agentd-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+url.workspace = true
+reqwest.workspace = true
+sha2.workspace = true
+hex.workspace = true
+uuid.workspace = true
+tokio.workspace = true
+base64 = "0.22"
+regex = "1"
+meval = "0.2"
+fastembed.workspace = true
+tokenizers.workspace = true
+agentd-api = { path = "../agentd-api" }
+agentd-store = { path = "../agentd-store" }
+
+[dev-dependencies]
+axum.workspace = true
+tempfile = "3"

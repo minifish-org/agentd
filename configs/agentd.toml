@@ -1,0 +1,42 @@
+# Template config for agentd. The runtime looks for a real config in this
+# order: $AGENTD_CONFIG → $HOME/.agentd.toml → this file.
+#
+# This file is checked into the repo, so it must NOT contain real secrets.
+# Copy it to ~/.agentd.toml and fill in your own values:
+#
+#   cp configs/agentd.toml ~/.agentd.toml
+#   $EDITOR ~/.agentd.toml
+#
+# launchd / systemd / docker etc. should point at the user copy (or set
+# AGENTD_CONFIG) rather than this template. Runtime paths support a leading
+# ${HOME} or ~ and must resolve to absolute locations outside the checkout.
+
+rest_addr = "127.0.0.1:8080"
+database_path = "${HOME}/Library/Application Support/agentd/data/agentd.db"
+scheduler_tick_ms = 1000
+run_concurrency = 4
+dispatch_poll_interval_ms = 250
+http_timeout_secs = 90
+
+# Optional API auth. When set, every /v1/* request must send
+# `Authorization: Bearer <api_token>` (CORS preflight and the static console at
+# `/` stay open). Unset is allowed only when `rest_addr` is loopback. Binding
+# to `0.0.0.0`, `::`, or another non-loopback address requires a non-empty
+# token. If you enable this, update every client to send the token.
+# api_token = "change-me"
+
+# LLM provider — agentd speaks ONE transport: the OpenAI-compatible
+# chat-completions API (`{llm_api_base}/chat/completions`) with native
+# `tools`/`tool_calls`. An agent's configured model overrides `llm_model`. Fill
+# real values in ~/.agentd.toml.
+llm_api_base = "http://127.0.0.1:8000/v1"
+llm_api_key = ""
+llm_model = "local/chat"
+
+# Fallback system_prompt for an agent without a persona. Unset = built-in
+# baseline.
+# default_chat_system_prompt = "..."
+
+# agentd is transport-neutral: drive agents over the tenant turn endpoint and
+# read results from the run output or delivery outbox. The built-in console is
+# served at `/`. Telegram and other transports remain external adapters.

@@ -1,0 +1,45 @@
+name: Security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dependencies:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          rust-version: "1.92.0"
+          command: check advisories licenses sources
+
+  current-tree-secrets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Prepare tracked source tree
+        shell: bash
+        run: |
+          scan_dir="$RUNNER_TEMP/agentd-tracked-tree/"
+          mkdir -p "$scan_dir"
+          git checkout-index --all --prefix="$scan_dir"
+      - name: Scan tracked files with Gitleaks
+        run: |
+          docker run --rm \
+            -v "$RUNNER_TEMP/agentd-tracked-tree:/src:ro" \
+            ghcr.io/gitleaks/gitleaks:v8.28.0@sha256:cdbb7c955abce02001a9f6c9f602fb195b7fadc1e812065883f695d1eeaba854 \
+            dir --redact --no-banner /src
