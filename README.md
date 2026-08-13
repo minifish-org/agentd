@@ -153,9 +153,20 @@ rows do not copy the output; claim/list responses join it from the run.
 Adapters acknowledge `delivered`, `retry`, or `failed`; expired claims are
 claimable again and retry updates the same row.
 
-See [architecture](docs/architecture.md), [HTTP API](docs/http-api.md), and
-[deployment](docs/deployment.md). Before exposing an instance beyond loopback,
-read the [threat model](docs/threat-model.md) and [security policy](SECURITY.md).
+## Project documentation
+
+- [Architecture and deliberate omissions](docs/architecture.md)
+- [HTTP API](docs/http-api.md)
+- [Deployment](docs/deployment.md)
+- [Reliability evidence and known gaps](docs/reliability.md)
+- [Threat model](docs/threat-model.md)
+- [Security policy](SECURITY.md)
+- [Contributing](CONTRIBUTING.md)
+- [Changelog](CHANGELOG.md)
+
+Before exposing an instance beyond loopback, read the threat model and security
+policy. Before changing a runtime invariant, read the reliability matrix and
+contribution guide.
 
 ## License
 
