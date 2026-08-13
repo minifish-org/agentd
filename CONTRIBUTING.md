@@ -41,6 +41,7 @@ cargo check --workspace --all-targets
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 bash scripts/test_deployment.sh
+./scripts/test-demo-provider.sh
 docker build --check .
 ```
 

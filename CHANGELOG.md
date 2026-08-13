@@ -16,6 +16,9 @@ not preserved unless a release note explicitly says otherwise.
 - Hybrid lexical/semantic memory using a pinned multilingual E5 Small ONNX
   model.
 - Native and Docker startup paths with checksum-verified model assets.
+- A deterministic, loopback-only demo provider and end-to-end turn script that
+  require no LLM credentials.
+- A macOS Bash 3.2-compatible API end-to-end harness.
 - CI, dependency advisory/license/source policy, current-tree secret scanning,
   security policy, threat model, and reliability evidence matrix.
 

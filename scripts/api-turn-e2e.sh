@@ -5,11 +5,13 @@ base=${AGENTD_URL:-http://127.0.0.1:8080}
 tenant=${AGENTD_TENANT:-demo}
 agent=${AGENTD_AGENT:-simple-bot}
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-auth=()
-test -z "${AGENTD_TOKEN:-}" || auth=(-H "Authorization: Bearer $AGENTD_TOKEN")
-
 request() {
-  curl --silent --show-error --fail "${auth[@]}" "$@"
+  if [[ -n "${AGENTD_TOKEN:-}" ]]; then
+    curl --silent --show-error --fail \
+      -H "Authorization: Bearer $AGENTD_TOKEN" "$@"
+  else
+    curl --silent --show-error --fail "$@"
+  fi
 }
 
 request -X POST "$base/v1/tenants" \

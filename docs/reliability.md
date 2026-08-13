@@ -26,6 +26,7 @@ reader can distinguish tested properties from design intent.
 | Schema mismatch requires explicit data reset | `schema_version_mismatch_requires_data_reset` | Store integration test |
 | A non-loopback listener requires a non-empty API token | `non_loopback_listener_requires_non_empty_api_token`; `non_loopback_listener_accepts_api_token`; `loopback_listener_allows_missing_api_token` | Configuration tests |
 | The pinned E5 model produces normalized 384-dimension vectors | `pinned_model_generates_normalized_384_dimension_vectors` | Real-model smoke test; ignored by default |
+| The deterministic demo provider returns a final response accepted by the native loop contract | `scripts/test-demo-provider.sh` | Loopback protocol smoke test |
 
 Test names are stable documentation targets only while the behavior remains in
 scope. A change that intentionally alters one of these properties must update
@@ -43,6 +44,16 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 bash scripts/test_deployment.sh
 ```
+
+The deterministic end-to-end demo exercises a real agentd process without an
+LLM credential. It is intentionally separate from the default suite because it
+loads the embedding model and starts local processes:
+
+```sh
+./scripts/demo-e2e.sh
+```
+
+See the [demo boundary](demo.md) for what this fixture does and does not prove.
 
 The real embedding smoke test requires the pinned assets:
 

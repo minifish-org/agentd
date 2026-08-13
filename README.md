@@ -37,6 +37,19 @@ audit, inspection, simulation, or export control plane.
 
 ## Start
 
+### Demo without LLM credentials
+
+With Rust, Python 3, `curl`, and `jq` installed, run the complete deterministic
+turn lifecycle against a loopback-only OpenAI-compatible fixture:
+
+```sh
+./scripts/demo-e2e.sh
+```
+
+The first run downloads about 448 MiB of checksum-verified embedding assets.
+The fixture proves the runtime/API path, not model quality or real tool-call
+compatibility. See the [demo boundary](docs/demo.md) for details.
+
 ### Native
 
 Native startup requires the pinned embedding assets. The fetch script downloads
@@ -158,6 +171,7 @@ claimable again and retry updates the same row.
 - [Architecture and deliberate omissions](docs/architecture.md)
 - [HTTP API](docs/http-api.md)
 - [Deployment](docs/deployment.md)
+- [Deterministic local demo](docs/demo.md)
 - [Reliability evidence and known gaps](docs/reliability.md)
 - [Threat model](docs/threat-model.md)
 - [Security policy](SECURITY.md)
