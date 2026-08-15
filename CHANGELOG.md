@@ -6,6 +6,8 @@ not preserved unless a release note explicitly says otherwise.
 
 ## Unreleased
 
+## [0.1.0-alpha.1] - 2026-08-15
+
 ### Added
 
 - Sanitized public source history under Apache-2.0.
@@ -32,4 +34,5 @@ not preserved unless a release note explicitly says otherwise.
   OpenAI-compatible provider; the credential-free demo is a protocol fixture.
 - The real embedding smoke test is not part of the default CI job.
 
-[Unreleased]: https://github.com/minifish-org/agentd/commits/main
+[Unreleased]: https://github.com/minifish-org/agentd/compare/v0.1.0-alpha.1...HEAD
+[0.1.0-alpha.1]: https://github.com/minifish-org/agentd/releases/tag/v0.1.0-alpha.1
