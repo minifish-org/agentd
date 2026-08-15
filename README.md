@@ -177,6 +177,7 @@ claimable again and retry updates the same row.
 - [Security policy](SECURITY.md)
 - [Contributing](CONTRIBUTING.md)
 - [Changelog](CHANGELOG.md)
+- [Draft v0.1.0-alpha.1 release notes](docs/releases/v0.1.0-alpha.1.md)
 
 Before exposing an instance beyond loopback, read the threat model and security
 policy. Before changing a runtime invariant, read the reliability matrix and

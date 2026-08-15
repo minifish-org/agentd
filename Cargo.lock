@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agentd"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "agentd-api",
  "agentd-core",
@@ -30,7 +30,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-api"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -43,7 +43,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-core"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "agentd-api",
  "agentd-store",
@@ -69,7 +69,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-store"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "agentd-api",
  "anyhow",

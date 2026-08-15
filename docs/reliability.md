@@ -66,8 +66,9 @@ AGENTD_EMBEDDING_MODEL_DIR="$model_dir" \
 ```
 
 Dependency advisory, dependency-license/source, and current-tree secret checks
-run in the `Security` GitHub Actions workflow. Container construction is
-validated separately from the Rust test suite.
+run in the `Security` GitHub Actions workflow. The manual and tag-triggered
+`Release check` workflow runs the real embedding smoke test and builds and
+inspects the complete container image in addition to the default checks.
 
 ## Evidence not yet present
 

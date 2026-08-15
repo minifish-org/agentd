@@ -1,0 +1,74 @@
+name: Release check
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-check-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: "0"
+      AGENTD_EMBEDDING_MODEL_DIR: ${{ github.workspace }}/.release-model/multilingual-e5-small
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            build
+            .release-model/multilingual-e5-small
+          key: release-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'scripts/fetch-embedding-model.sh') }}
+
+      - name: Validate release version
+        id: version
+        shell: bash
+        run: |
+          tag=
+          test "${GITHUB_REF_TYPE:-}" != tag || tag="$GITHUB_REF_NAME"
+          version=$(./scripts/release-version.sh "$tag")
+          printf 'version=%s\n' "$version" >>"$GITHUB_OUTPUT"
+          printf 'release version: %s\n' "$version"
+
+      - name: Rust and deployment checks
+        run: |
+          cargo fmt --all -- --check
+          cargo check --workspace --all-targets
+          cargo test --workspace
+          cargo clippy --workspace --all-targets -- -D warnings
+          bash scripts/test_deployment.sh
+
+      - name: Fetch pinned embedding assets
+        run: ./scripts/fetch-embedding-model.sh "$AGENTD_EMBEDDING_MODEL_DIR"
+
+      - name: Run real embedding smoke test
+        run: |
+          cargo test -p agentd-core \
+            pinned_model_generates_normalized_384_dimension_vectors -- --ignored
+
+      - name: Build and inspect release image
+        run: |
+          image="agentd:release-check-${GITHUB_SHA}"
+          docker build --check .
+          docker build \
+            --label "org.opencontainers.image.version=${{ steps.version.outputs.version }}" \
+            --tag "$image" .
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.licenses" }}' "$image")" = "Apache-2.0"
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$image")" = "${{ steps.version.outputs.version }}"
+          test "$(docker image inspect --format '{{ .Config.User }}' "$image")" = "agentd"
+          docker run --rm --entrypoint sh "$image" -c '
+            test -f /usr/share/doc/agentd/LICENSE
+            test -f /usr/share/doc/agentd/THIRD_PARTY_NOTICES.md
+            test -f /opt/agentd/models/multilingual-e5-small/LICENSE
+          '

@@ -28,7 +28,8 @@ not preserved unless a release note explicitly says otherwise.
 - The HTTP API is experimental and may change without a migration path.
 - TLS, rate limiting, quotas, HA, and MCP process sandboxing are deployment
   responsibilities.
-- A real OpenAI-compatible provider is required for an end-to-end turn.
+- Real model behavior and tool-call interoperability require a real
+  OpenAI-compatible provider; the credential-free demo is a protocol fixture.
 - The real embedding smoke test is not part of the default CI job.
 
 [Unreleased]: https://github.com/minifish-org/agentd/commits/main
