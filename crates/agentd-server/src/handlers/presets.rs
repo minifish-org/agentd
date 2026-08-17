@@ -52,7 +52,7 @@ pub(crate) async fn install_memory_maintenance(
                 max_steps: 64,
             },
             system_prompt: Some(MEMORY_MAINTAINER_PROMPT.to_string()),
-            model: None,
+            model: Some("standard/chat".to_string()),
             temperature: Some(0.1),
             max_tokens: None,
             context_window: Some(0),
@@ -67,9 +67,19 @@ pub(crate) async fn install_memory_maintenance(
         .get_agent(&tenant, MEMORY_MAINTAINER_AGENT)
         .await
     {
-        Ok(Some(existing))
+        Ok(Some(mut existing))
             if existing.spec.allowed_families.as_deref() == Some(&[ToolFamily::Memory]) =>
         {
+            if existing.spec.model.as_deref() != Some("standard/chat") {
+                existing.spec.model = Some("standard/chat".to_string());
+                let updated = AgentResource {
+                    metadata: existing.metadata,
+                    spec: existing.spec,
+                };
+                if let Err(error) = state.store.apply_agent(&updated).await {
+                    return error_response(error);
+                }
+            }
             false
         }
         Ok(Some(_)) => {

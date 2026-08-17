@@ -12,6 +12,12 @@ not preserved unless a release note explicitly says otherwise.
 - An explicit per-tenant memory-maintenance preset whose schedule is disabled
   by default and whose agent can access only the memory tool family.
 
+### Changed
+
+- Memory-maintenance agents now use `standard/chat`; the native loop requires
+  them to complete tenant-bound `memory_list` pagination before reporting
+  success or modifying memory.
+
 ## [0.1.0-alpha.1] - 2026-08-15
 
 ### Added

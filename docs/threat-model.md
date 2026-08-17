@@ -87,6 +87,9 @@ validated against the current run's tenant and namespace, and list responses
 exclude embeddings and internal database identifiers. The optional maintenance
 preset installs a memory-only agent and a disabled schedule; it does not grant
 cross-tenant access or start model calls until an operator enables the schedule.
+The reserved maintainer is pinned to `standard/chat`; its native loop binds
+memory calls to the run's input namespace, blocks mutations until enumeration is
+complete, and rejects a final response if any `memory_list` page remains unread.
 
 ### MCP servers
 

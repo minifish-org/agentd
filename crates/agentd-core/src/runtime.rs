@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 
 const DEFAULT_CONTEXT_TURNS: usize = 20;
+const MEMORY_MAINTAINER_AGENT: &str = "system/memory-maintainer";
 
 const NATIVE_LOOP_PROMPT: &str = r#"Native tool rules:
 - Use real tool calls when a capability is needed.
@@ -30,6 +31,130 @@ pub struct ExecutionReport {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MemoryMaintenanceProgress {
+    NotStarted,
+    AwaitingCursor(String),
+    Complete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MemoryMaintenanceScan {
+    NotRequired,
+    Required {
+        namespace: String,
+        progress: MemoryMaintenanceProgress,
+    },
+}
+
+impl MemoryMaintenanceScan {
+    fn for_run(agent_ref: &str, input: &Value) -> Result<Self> {
+        if agent_ref != MEMORY_MAINTAINER_AGENT {
+            return Ok(Self::NotRequired);
+        }
+        let namespace = input
+            .get("namespace")
+            .and_then(Value::as_str)
+            .filter(|namespace| !namespace.is_empty())
+            .ok_or_else(|| anyhow!("memory maintainer input requires a non-empty namespace"))?;
+        Ok(Self::Required {
+            namespace: namespace.to_string(),
+            progress: MemoryMaintenanceProgress::NotStarted,
+        })
+    }
+
+    fn validate_tool_call(&self, tool: &str, arguments: &Value) -> Result<()> {
+        let Self::Required {
+            namespace,
+            progress,
+        } = self
+        else {
+            return Ok(());
+        };
+        if !tool.starts_with("memory_") {
+            return Ok(());
+        }
+        let actual_namespace = arguments.get("namespace").and_then(Value::as_str);
+        if actual_namespace != Some(namespace.as_str()) {
+            return Err(anyhow!(
+                "memory maintainer tools must use input namespace {namespace:?}"
+            ));
+        }
+        if matches!(tool, "memory_put" | "memory_delete")
+            && !matches!(progress, MemoryMaintenanceProgress::Complete)
+        {
+            return Err(anyhow!(
+                "memory maintainer cannot modify memory before completing memory_list"
+            ));
+        }
+        if tool != "memory_list" {
+            return Ok(());
+        }
+        let cursor = arguments.get("cursor").and_then(Value::as_str);
+        match progress {
+            MemoryMaintenanceProgress::NotStarted | MemoryMaintenanceProgress::Complete
+                if cursor.is_none() =>
+            {
+                Ok(())
+            }
+            MemoryMaintenanceProgress::AwaitingCursor(expected)
+                if cursor == Some(expected.as_str()) =>
+            {
+                Ok(())
+            }
+            MemoryMaintenanceProgress::NotStarted | MemoryMaintenanceProgress::Complete => Err(
+                anyhow!("memory maintainer must start memory_list without a cursor"),
+            ),
+            MemoryMaintenanceProgress::AwaitingCursor(_) => Err(anyhow!(
+                "memory maintainer must continue memory_list with the returned next_cursor"
+            )),
+        }
+    }
+
+    fn observe_list_result(&mut self, tool: &str, result: &ToolResult) -> Result<()> {
+        let Self::Required { progress, .. } = self else {
+            return Ok(());
+        };
+        if tool != "memory_list" || !result.ok {
+            return Ok(());
+        }
+        *progress = match result.result.get("next_cursor") {
+            Some(Value::Null) => MemoryMaintenanceProgress::Complete,
+            Some(Value::String(cursor)) if !cursor.is_empty() => {
+                MemoryMaintenanceProgress::AwaitingCursor(cursor.clone())
+            }
+            _ => {
+                return Err(anyhow!(
+                    "memory_list result must contain a null or non-empty next_cursor"
+                ));
+            }
+        };
+        Ok(())
+    }
+
+    fn ensure_complete(&self) -> Result<()> {
+        match self {
+            Self::NotRequired
+            | Self::Required {
+                progress: MemoryMaintenanceProgress::Complete,
+                ..
+            } => Ok(()),
+            Self::Required {
+                progress: MemoryMaintenanceProgress::NotStarted,
+                ..
+            } => Err(anyhow!(
+                "memory maintainer cannot finish before calling memory_list"
+            )),
+            Self::Required {
+                progress: MemoryMaintenanceProgress::AwaitingCursor(_),
+                ..
+            } => Err(anyhow!(
+                "memory maintainer cannot finish before following next_cursor to completion"
+            )),
+        }
+    }
+}
+
 impl RuntimeEngine {
     pub fn new(caps: CapabilityEngine, store: AgentdStore) -> Self {
         Self { caps, store }
@@ -46,6 +171,7 @@ impl RuntimeEngine {
 
     async fn run_agent(&self, assigned: &AssignedRun) -> Result<()> {
         let run = &assigned.run;
+        let mut maintenance_scan = MemoryMaintenanceScan::for_run(&run.agent_ref, &run.input)?;
         let prior_state = self
             .store
             .get_context_state(&run.tenant, &run.agent_ref, &run.scope)
@@ -120,6 +246,7 @@ impl RuntimeEngine {
                 .cloned()
                 .unwrap_or_default();
             if tool_calls.is_empty() {
+                maintenance_scan.ensure_complete()?;
                 let content = extract_openai_message_content(&response)
                     .ok_or_else(|| anyhow!("model returned neither tool calls nor content"))?;
                 if content.trim().is_empty() {
@@ -159,6 +286,7 @@ impl RuntimeEngine {
                     .map_err(|error| anyhow!("invalid arguments for {name}: {error}"))?;
                 let arguments =
                     inject_runtime_context(&name, arguments, &run.agent_ref, &run.scope);
+                maintenance_scan.validate_tool_call(&name, &arguments)?;
 
                 self.store
                     .append_event(
@@ -192,6 +320,7 @@ impl RuntimeEngine {
                         Utc::now(),
                     )
                     .await?;
+                maintenance_scan.observe_list_result(&name, &envelope)?;
                 let content = if envelope.ok {
                     envelope.result.to_string()
                 } else {
@@ -343,8 +472,8 @@ fn tool_error(error: &str) -> ToolResult {
 
 #[cfg(test)]
 mod tests {
-    use super::{next_context_state, parse_json_object, RuntimeEngine};
-    use crate::{CapabilityEngine, CapabilityEngineConfig};
+    use super::{next_context_state, parse_json_object, MemoryMaintenanceScan, RuntimeEngine};
+    use crate::{CapabilityEngine, CapabilityEngineConfig, ToolResult};
     use agentd_api::{AgentLimits, AgentResource, AgentSpec, ResourceMeta, ToolFamily};
     use agentd_store::{AgentdStore, NewRun};
     use axum::{routing::post, Json, Router};
@@ -381,6 +510,59 @@ mod tests {
         );
         assert!(parse_json_object("\"plain string\"").is_none());
         assert!(parse_json_object("[1,2,3]").is_none());
+    }
+
+    #[test]
+    fn maintainer_scan_requires_bound_complete_pagination_before_mutation() {
+        let mut scan = MemoryMaintenanceScan::for_run(
+            "system/memory-maintainer",
+            &json!({"namespace":"profile"}),
+        )
+        .unwrap();
+        assert!(scan.ensure_complete().is_err());
+        assert!(scan
+            .validate_tool_call("memory_delete", &json!({"namespace":"profile","id":"old"}),)
+            .is_err());
+        assert!(scan
+            .validate_tool_call("memory_list", &json!({"namespace":"other"}))
+            .is_err());
+
+        scan.validate_tool_call("memory_list", &json!({"namespace":"profile"}))
+            .unwrap();
+        scan.observe_list_result(
+            "memory_list",
+            &ToolResult {
+                ok: true,
+                result: json!({"items":[],"next_cursor":"cursor-1"}),
+                error: None,
+            },
+        )
+        .unwrap();
+        assert!(scan.ensure_complete().is_err());
+        assert!(scan
+            .validate_tool_call(
+                "memory_list",
+                &json!({"namespace":"profile","cursor":"wrong"}),
+            )
+            .is_err());
+
+        scan.validate_tool_call(
+            "memory_list",
+            &json!({"namespace":"profile","cursor":"cursor-1"}),
+        )
+        .unwrap();
+        scan.observe_list_result(
+            "memory_list",
+            &ToolResult {
+                ok: true,
+                result: json!({"items":[],"next_cursor":null}),
+                error: None,
+            },
+        )
+        .unwrap();
+        scan.ensure_complete().unwrap();
+        scan.validate_tool_call("memory_delete", &json!({"namespace":"profile","id":"old"}))
+            .unwrap();
     }
 
     #[tokio::test]
@@ -495,6 +677,96 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn maintainer_cannot_finish_without_calling_memory_list() {
+        async fn completion() -> Json<serde_json::Value> {
+            Json(json!({
+                "choices":[{"message":{"role":"assistant","content":"{\"namespace\":\"profile\",\"scanned\":0}"}}]
+            }))
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/v1/chat/completions", post(completion)),
+            )
+            .await
+            .unwrap();
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = AgentdStore::new(directory.path().join("agentd.db").to_str().unwrap())
+            .await
+            .unwrap();
+        store.create_tenant("demo", &json!({})).await.unwrap();
+        store
+            .apply_agent(&AgentResource {
+                metadata: ResourceMeta {
+                    name: "system/memory-maintainer".into(),
+                    tenant: "demo".into(),
+                    labels: BTreeMap::new(),
+                },
+                spec: AgentSpec {
+                    allowed_families: Some(vec![ToolFamily::Memory]),
+                    limits: AgentLimits {
+                        timeout_ms: 5_000,
+                        max_steps: 2,
+                    },
+                    system_prompt: None,
+                    model: Some("standard/chat".into()),
+                    temperature: None,
+                    max_tokens: None,
+                    context_window: Some(0),
+                },
+            })
+            .await
+            .unwrap();
+        let caps = CapabilityEngine::new_with_config(
+            store.clone(),
+            CapabilityEngineConfig {
+                llm_api_base: Some(format!("http://{address}/v1")),
+                llm_api_key: None,
+                llm_model: Some("test".into()),
+                ..CapabilityEngineConfig::default()
+            },
+        );
+        let input = json!({"namespace":"profile"});
+        let run_id = store
+            .submit_run(NewRun {
+                tenant: "demo",
+                name: "maintenance",
+                agent_ref: "system/memory-maintainer",
+                scope: "memory-maintenance/profile",
+                source: "test",
+                input: &input,
+                request_id: None,
+                schedule_name: None,
+                delivery_destination: None,
+            })
+            .await
+            .unwrap();
+        let assigned = store.claim_next_run().await.unwrap().unwrap();
+        let report = RuntimeEngine::new(caps, store.clone())
+            .execute_assigned_run(&assigned)
+            .await
+            .unwrap();
+
+        assert!(report
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("cannot finish before calling memory_list"));
+        assert!(store.get_run_output(run_id).await.unwrap().is_none());
+        assert!(store
+            .list_run_log(run_id)
+            .await
+            .unwrap()
+            .iter()
+            .all(|event| event.kind == "model"));
         server.abort();
     }
 

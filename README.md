@@ -148,10 +148,12 @@ IDs, text, and timestamps; use `memory_search` for relevance retrieval.
 
 Install the optional per-tenant maintenance resources explicitly with
 `POST /v1/tenants/:tenant/presets/memory-maintenance`. The preset creates a
-memory-only `system/memory-maintainer` agent and a weekly
+memory-only `system/memory-maintainer` agent pinned to `standard/chat` and a weekly
 `system/memory-maintenance` schedule. The schedule starts disabled and has no
 delivery destination, so installation alone produces no model calls or memory
-changes. Enable or customize it through the normal schedule API.
+changes. Enable or customize it through the normal schedule API. Maintainer runs
+cannot succeed or mutate memory until they complete `memory_list` pagination for
+the namespace supplied by the run input.
 
 MCP servers are tenant resources at `/v1/tenants/:tenant/mcp/:name`. Transport
 is a strict tagged object: stdio contains `command`, `args`, and optional
