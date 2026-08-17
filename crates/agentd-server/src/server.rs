@@ -429,6 +429,7 @@ mod tests {
         assert_eq!(agents.as_array().unwrap().len(), 1);
         assert_eq!(agents[0]["name"], "system/memory-maintainer");
         assert_eq!(agents[0]["allowed_families"], json!(["memory"]));
+        assert_eq!(agents[0]["model"], "standard/chat");
         assert_eq!(agents[0]["max_steps"], 64);
         assert_eq!(agents[0]["context_window"], 0);
         assert_eq!(
@@ -464,6 +465,20 @@ mod tests {
             StatusCode::OK
         );
 
+        let mut legacy_agent = agents[0].clone();
+        legacy_agent["model"] = Value::Null;
+        assert_eq!(
+            request(
+                &app,
+                Method::PUT,
+                "/v1/tenants/demo/agents/system%2Fmemory-maintainer",
+                Some(legacy_agent),
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+
         let repeated = request(
             &app,
             Method::POST,
@@ -474,6 +489,8 @@ mod tests {
         assert_eq!(repeated.0, StatusCode::OK);
         assert_eq!(repeated.1["agent_created"], false);
         assert_eq!(repeated.1["schedule_created"], false);
+        let (_, agents) = request(&app, Method::GET, "/v1/tenants/demo/agents", None).await;
+        assert_eq!(agents[0]["model"], "standard/chat");
         let (_, schedules) = request(&app, Method::GET, "/v1/tenants/demo/schedules", None).await;
         assert_eq!(schedules[0]["spec"]["enabled"], true);
         assert!(!schedules[0]["next_trigger_at"].is_null());
