@@ -6,6 +6,12 @@ not preserved unless a release note explicitly says otherwise.
 
 ## Unreleased
 
+### Added
+
+- Stable, bounded `memory_list` pagination with tenant/namespace-bound cursors.
+- An explicit per-tenant memory-maintenance preset whose schedule is disabled
+  by default and whose agent can access only the memory tool family.
+
 ## [0.1.0-alpha.1] - 2026-08-15
 
 ### Added

@@ -82,6 +82,12 @@ Artifact request bodies are capped at 64 MiB. The service does not currently
 provide request rate limits, storage quotas, or per-tenant CPU/memory budgets,
 so network and host-level resource controls remain necessary.
 
+`memory_list` is bounded to one namespace and 100 items per call. Its cursor is
+validated against the current run's tenant and namespace, and list responses
+exclude embeddings and internal database identifiers. The optional maintenance
+preset installs a memory-only agent and a disabled schedule; it does not grant
+cross-tenant access or start model calls until an operator enables the schedule.
+
 ### MCP servers
 
 MCP configuration is operator-controlled. Secret values are referenced by

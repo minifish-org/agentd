@@ -12,6 +12,7 @@ use crate::handlers::mcp::{
     delete_mcp_server, get_mcp_server, list_mcp_servers, put_mcp_server, rediscover_enabled_servers,
 };
 use crate::handlers::memory::{get_memory_item, search_memory};
+use crate::handlers::presets::install_memory_maintenance;
 use crate::handlers::runs::{cancel_run, get_run, get_run_trace, list_runs, wait_run};
 use crate::handlers::schedules::{delete_schedule, get_schedule, list_schedules, put_schedule};
 use crate::handlers::tools::list_tools;
@@ -108,6 +109,10 @@ pub(crate) fn build_router(app_state: AppState, api_token: Option<String>) -> Ro
         .route(
             "/v1/tenants/:name",
             get(get_tenant).patch(patch_tenant).delete(delete_tenant),
+        )
+        .route(
+            "/v1/tenants/:tenant/presets/memory-maintenance",
+            post(install_memory_maintenance),
         )
         .route("/v1/tenants/:tenant/agents", get(list_agents))
         .route(
@@ -379,5 +384,98 @@ mod tests {
         ] {
             assert!(!html.contains(write_surface), "found {write_surface}");
         }
+    }
+
+    #[tokio::test]
+    async fn memory_maintenance_preset_is_tenant_scoped_restricted_and_disabled() {
+        let (_dir, app) = app().await;
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                "/v1/tenants/missing/presets/memory-maintenance",
+                None,
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                "/v1/tenants",
+                Some(json!({"name":"demo"})),
+            )
+            .await
+            .0,
+            StatusCode::CREATED
+        );
+
+        let installed = request(
+            &app,
+            Method::POST,
+            "/v1/tenants/demo/presets/memory-maintenance",
+            None,
+        )
+        .await;
+        assert_eq!(installed.0, StatusCode::CREATED);
+        assert_eq!(installed.1["agent_ref"], "system/memory-maintainer");
+        assert_eq!(installed.1["schedule"], "system/memory-maintenance");
+        assert_eq!(installed.1["agent_created"], true);
+        assert_eq!(installed.1["schedule_created"], true);
+
+        let (_, agents) = request(&app, Method::GET, "/v1/tenants/demo/agents", None).await;
+        assert_eq!(agents.as_array().unwrap().len(), 1);
+        assert_eq!(agents[0]["name"], "system/memory-maintainer");
+        assert_eq!(agents[0]["allowed_families"], json!(["memory"]));
+        assert_eq!(agents[0]["max_steps"], 64);
+        assert_eq!(agents[0]["context_window"], 0);
+        assert_eq!(
+            request(
+                &app,
+                Method::GET,
+                "/v1/tenants/demo/agents/system%2Fmemory-maintainer",
+                None,
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+
+        let (_, schedules) = request(&app, Method::GET, "/v1/tenants/demo/schedules", None).await;
+        assert_eq!(schedules.as_array().unwrap().len(), 1);
+        assert_eq!(schedules[0]["name"], "system/memory-maintenance");
+        assert_eq!(schedules[0]["spec"]["enabled"], false);
+        assert_eq!(schedules[0]["spec"]["delivery"], Value::Null);
+        assert_eq!(schedules[0]["next_trigger_at"], Value::Null);
+
+        let mut enabled_spec = schedules[0]["spec"].clone();
+        enabled_spec["enabled"] = json!(true);
+        assert_eq!(
+            request(
+                &app,
+                Method::PUT,
+                "/v1/tenants/demo/schedules/system%2Fmemory-maintenance",
+                Some(enabled_spec),
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+
+        let repeated = request(
+            &app,
+            Method::POST,
+            "/v1/tenants/demo/presets/memory-maintenance",
+            None,
+        )
+        .await;
+        assert_eq!(repeated.0, StatusCode::OK);
+        assert_eq!(repeated.1["agent_created"], false);
+        assert_eq!(repeated.1["schedule_created"], false);
+        let (_, schedules) = request(&app, Method::GET, "/v1/tenants/demo/schedules", None).await;
+        assert_eq!(schedules[0]["spec"]["enabled"], true);
+        assert!(!schedules[0]["next_trigger_at"].is_null());
     }
 }

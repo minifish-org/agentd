@@ -23,6 +23,8 @@ reader can distinguish tested properties from design intent.
 | MCP discovery respects the all-tools or explicit allowlist boundary | `discovery_exposes_all_or_an_allowlist`; `discovery_rejects_unknown_allowed_tools` | Server tests |
 | Public web fetch rejects private addresses and returns the socket addresses that were checked | `public_url_resolution_rejects_private_addresses`; `public_url_resolution_returns_the_checked_socket_addresses` | Core network-boundary tests |
 | Memory rejects invalid vectors and remains tenant/namespace scoped across hybrid search | `memory_rejects_wrong_dimensions_and_oversized_text`; `memory_hybrid_search_is_tenant_and_namespace_scoped` | Store integration tests |
+| Memory enumeration is stable, bounded, tenant/namespace scoped, cursor-bound, and traced through the native loop | `memory_list_pages_are_stable_bounded_and_tenant_scoped`; `memory_list_cursor_is_bound_to_tenant_and_namespace`; `memory_changes_only_through_traced_model_tool_calls` | Store and core integration tests |
+| The memory-maintenance preset installs a memory-only agent and a disabled, explicitly enableable tenant schedule | `memory_maintenance_preset_is_tenant_scoped_restricted_and_disabled` | In-process HTTP integration test |
 | Schema mismatch requires explicit data reset | `schema_version_mismatch_requires_data_reset` | Store integration test |
 | A non-loopback listener requires a non-empty API token | `non_loopback_listener_requires_non_empty_api_token`; `non_loopback_listener_accepts_api_token`; `loopback_listener_allows_missing_api_token` | Configuration tests |
 | The pinned E5 model produces normalized 384-dimension vectors | `pinned_model_generates_normalized_384_dimension_vectors` | Real-model smoke test; ignored by default |

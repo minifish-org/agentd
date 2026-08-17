@@ -127,7 +127,7 @@ idempotency key.
 
 ## Tools
 
-There are 15 built-ins: artifact read/write/list; memory get/search/put/delete;
+There are 16 built-ins: artifact read/write/list; memory get/search/list/put/delete;
 schedule get/list/put/delete; clock now; public-web search/fetch; and pure
 arithmetic. Names are canonical `family_action` names. Mutating tools execute
 when their family is allowed; there is no generic operator execute endpoint or
@@ -141,6 +141,17 @@ lexical-only results. Queries use the E5 `query:` prefix and facts use
 `passage:`; inputs over 512 model tokens are rejected in favor of artifacts.
 The model decides when to search or write memory, and those actions remain
 ordinary traced tool calls.
+
+`memory_list` enumerates one namespace with a host-clamped page size and an
+opaque cursor bound to the current run's tenant and namespace. It returns only
+IDs, text, and timestamps; use `memory_search` for relevance retrieval.
+
+Install the optional per-tenant maintenance resources explicitly with
+`POST /v1/tenants/:tenant/presets/memory-maintenance`. The preset creates a
+memory-only `system/memory-maintainer` agent and a weekly
+`system/memory-maintenance` schedule. The schedule starts disabled and has no
+delivery destination, so installation alone produces no model calls or memory
+changes. Enable or customize it through the normal schedule API.
 
 MCP servers are tenant resources at `/v1/tenants/:tenant/mcp/:name`. Transport
 is a strict tagged object: stdio contains `command`, `args`, and optional

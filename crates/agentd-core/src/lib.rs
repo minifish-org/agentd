@@ -211,6 +211,7 @@ impl CapabilityEngine {
             "artifact_list" => self.execute_artifact_list(tenant, params).await,
             "memory_get" => self.execute_memory_get(tenant, params).await,
             "memory_search" => self.execute_memory_search(tenant, params).await,
+            "memory_list" => self.execute_memory_list(tenant, params).await,
             "memory_put" => self.execute_memory_put(tenant, params).await,
             "memory_delete" => self.execute_memory_delete(tenant, params).await,
             "schedule_get" => self.execute_schedule_get(tenant, params).await,
