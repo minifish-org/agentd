@@ -651,6 +651,21 @@ pub struct MemoryItem {
     pub score: Option<f64>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct MemoryListItem {
+    pub id: String,
+    pub text: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct MemoryPage {
+    pub items: Vec<MemoryListItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_after_id: Option<String>,
+}
+
 #[derive(Debug)]
 struct SemanticMemoryHit {
     similarity: f64,
@@ -891,6 +906,64 @@ impl AgentdStore {
         .fetch_optional(&self.pool)
         .await?;
         row.map(|row| memory_item_from_row(row, None)).transpose()
+    }
+
+    pub async fn list_memory_page(
+        &self,
+        tenant: &str,
+        namespace: &str,
+        after_id: Option<&str>,
+        limit: usize,
+    ) -> Result<MemoryPage> {
+        let namespace = normalize_memory_component(namespace, "namespace")?;
+        let after_id = after_id
+            .map(|id| normalize_memory_component(id, "cursor id"))
+            .transpose()?;
+        let limit = limit.clamp(1, 100);
+        let rows = if let Some(after_id) = after_id.as_deref() {
+            db::query(
+                "SELECT id, text, created_at, updated_at FROM memory \
+                 WHERE tenant = ? AND namespace = ? AND id > ? \
+                 ORDER BY id ASC LIMIT ?",
+            )
+            .bind(tenant)
+            .bind(&namespace)
+            .bind(after_id)
+            .bind((limit + 1) as i64)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            db::query(
+                "SELECT id, text, created_at, updated_at FROM memory \
+                 WHERE tenant = ? AND namespace = ? \
+                 ORDER BY id ASC LIMIT ?",
+            )
+            .bind(tenant)
+            .bind(&namespace)
+            .bind((limit + 1) as i64)
+            .fetch_all(&self.pool)
+            .await?
+        };
+        let has_more = rows.len() > limit;
+        let items = rows
+            .into_iter()
+            .take(limit)
+            .map(|row| {
+                Ok(MemoryListItem {
+                    id: row.try_get("id")?,
+                    text: row.try_get("text")?,
+                    created_at: row.try_get("created_at")?,
+                    updated_at: row.try_get("updated_at")?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let next_after_id = has_more
+            .then(|| items.last().map(|item| item.id.clone()))
+            .flatten();
+        Ok(MemoryPage {
+            items,
+            next_after_id,
+        })
     }
 
     pub async fn search_memory(
@@ -3187,6 +3260,69 @@ mod tests {
         assert_eq!(matches[0].tenant, "one");
         assert_eq!(matches[0].namespace, "profile");
         assert!(matches[0].score.is_some_and(|score| score > 0.0));
+    }
+
+    #[tokio::test]
+    async fn memory_list_pages_are_stable_bounded_and_tenant_scoped() {
+        let (_dir, store) = store().await;
+        tenant_with_agent(&store, "one").await;
+        tenant_with_agent(&store, "two").await;
+        let embedding = test_embedding(0);
+        for index in 0..105 {
+            store
+                .put_memory(
+                    "one",
+                    "profile",
+                    &format!("fact-{index:03}"),
+                    &format!("fact {index}"),
+                    &embedding,
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .put_memory("one", "other", "secret", "other namespace", &embedding)
+            .await
+            .unwrap();
+        store
+            .put_memory("two", "profile", "secret", "other tenant", &embedding)
+            .await
+            .unwrap();
+
+        let clamped = store
+            .list_memory_page("one", "profile", None, usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(clamped.items.len(), 100);
+        assert_eq!(clamped.next_after_id.as_deref(), Some("fact-099"));
+        assert_eq!(
+            store
+                .list_memory_page("one", "profile", None, 0)
+                .await
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+
+        let mut after_id = None;
+        let mut ids = Vec::new();
+        loop {
+            let page = store
+                .list_memory_page("one", "profile", after_id.as_deref(), 17)
+                .await
+                .unwrap();
+            ids.extend(page.items.into_iter().map(|item| item.id));
+            after_id = page.next_after_id;
+            if after_id.is_none() {
+                break;
+            }
+        }
+        assert_eq!(ids.len(), 105);
+        assert_eq!(ids.first().map(String::as_str), Some("fact-000"));
+        assert_eq!(ids.last().map(String::as_str), Some("fact-104"));
+        assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(!ids.iter().any(|id| id == "secret"));
     }
 
     #[tokio::test]

@@ -50,6 +50,13 @@ only inside the selected tenant/namespace and fuses semantic and lexical ranks
 with RRF. There are no dynamic RAG tables, vector metadata resources,
 automatic recall, or automatic writes.
 
+Enumeration uses bounded keyset pages over one tenant and namespace. The
+optional memory maintainer is an ordinary tenant agent plus an ordinary
+disabled-by-default schedule: due work enters the same queued run, claim,
+native tool loop, and `run_log` path as interactive work. There is no background
+agent type, heartbeat, cross-tenant maintainer, or host-side consolidation
+primitive.
+
 ## Deliberate omissions
 
 There is no independent CLI, Controller forwarding layer, compatibility

@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 /// The complete host-builtin catalog. Runtime mechanics are deliberately not
 /// tools: every entry below is a real capability the model may exercise.
 pub fn builtin_tool_catalog() -> Vec<ToolSpec> {
-    let mut tools = Vec::with_capacity(15);
+    let mut tools = Vec::with_capacity(16);
 
     add(
         &mut tools,
@@ -59,6 +59,18 @@ pub fn builtin_tool_catalog() -> Vec<ToolSpec> {
         json!({"type":"object","required":["query"],"properties":{
             "query":{"type":"string","minLength":1},"namespace":{"type":"string"},
             "limit":{"type":"integer","minimum":1,"maximum":20}
+        }}),
+    );
+    add(
+        &mut tools,
+        ToolFamily::Memory,
+        "list",
+        "List one namespace of durable memory in stable, bounded pages. Use this for audits and maintenance; use memory_search for relevance retrieval.",
+        false,
+        json!({"type":"object","properties":{
+            "namespace":{"type":"string"},
+            "limit":{"type":"integer","minimum":1,"maximum":100},
+            "cursor":{"type":"string","minLength":1}
         }}),
     );
     add(
@@ -202,9 +214,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalog_contains_only_the_fifteen_real_capabilities() {
+    fn catalog_contains_only_the_sixteen_real_capabilities() {
         let tools = builtin_tool_catalog();
-        assert_eq!(tools.len(), 15);
+        assert_eq!(tools.len(), 16);
         assert!(tools
             .iter()
             .all(|tool| ToolFamily::all().contains(&tool.family)));
@@ -212,6 +224,6 @@ mod tests {
             .iter()
             .any(|tool| tool.name == "memory_put" && tool.mutating));
         assert!(visible_tools(&tools, &[]).is_empty());
-        assert_eq!(visible_tools(&tools, &[ToolFamily::Memory]).len(), 4);
+        assert_eq!(visible_tools(&tools, &[ToolFamily::Memory]).len(), 5);
     }
 }

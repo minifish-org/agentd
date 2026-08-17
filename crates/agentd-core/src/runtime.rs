@@ -515,14 +515,24 @@ mod tests {
                     "choices":[{"message":{
                         "role":"assistant",
                         "content":null,
-                        "tool_calls":[{
-                            "id":"memory-call",
-                            "type":"function",
-                            "function":{
-                                "name":"memory_put",
-                                "arguments":"{\"id\":\"favorite-fruit\",\"text\":\"likes durian\"}"
+                        "tool_calls":[
+                            {
+                                "id":"memory-list-call",
+                                "type":"function",
+                                "function":{
+                                    "name":"memory_list",
+                                    "arguments":"{\"limit\":50}"
+                                }
+                            },
+                            {
+                                "id":"memory-put-call",
+                                "type":"function",
+                                "function":{
+                                    "name":"memory_put",
+                                    "arguments":"{\"id\":\"favorite-fruit\",\"text\":\"likes durian\"}"
+                                }
                             }
-                        }]
+                        ]
                     }}]
                 }))
             }
@@ -614,9 +624,11 @@ mod tests {
             .iter()
             .filter(|event| event.kind == "tool")
             .collect::<Vec<_>>();
-        assert_eq!(tool_events.len(), 2);
-        assert_eq!(tool_events[0].payload["name"], "memory_put");
+        assert_eq!(tool_events.len(), 4);
+        assert_eq!(tool_events[0].payload["name"], "memory_list");
         assert_eq!(tool_events[0].payload["arguments"]["namespace"], "bot");
+        assert_eq!(tool_events[2].payload["name"], "memory_put");
+        assert_eq!(tool_events[2].payload["arguments"]["namespace"], "bot");
         server.abort();
     }
 }

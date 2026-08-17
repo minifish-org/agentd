@@ -12,6 +12,7 @@ query parameter.
 | Context | list/get/delete under `.../contexts/:agent` |
 | Artifact | list and `GET/PUT/DELETE .../artifacts/:path` |
 | Memory | `GET .../memory/:id`, `GET .../memory/search` |
+| Preset | `POST .../presets/memory-maintenance` |
 | Schedule | list and `GET/PUT/DELETE .../schedules/:name` |
 | Tool | `GET .../tools` |
 | MCP | list and `GET/PUT/DELETE .../mcp/:name` |
@@ -78,6 +79,17 @@ name, while the operator REST defaults to `default`. Search combines FTS5 and
 semantic ranks and returns a positive fused `score`; its default limit is 5 and
 maximum is 20. Writes are available only to agents through
 `memory_put`/`memory_delete` and fail atomically when embedding fails.
+
+The agent-only `memory_list` tool enumerates one namespace in ID order. Its
+limit is clamped to `1..=100`; `next_cursor=null` marks completion. Cursors are
+opaque and bound to the current run's tenant and requested namespace. List
+items contain ID, text, and timestamps, never embeddings or database row IDs.
+
+`POST .../presets/memory-maintenance` idempotently creates the reserved
+memory-only maintainer agent and its weekly schedule. The schedule is disabled
+and has no delivery by default. Reapplying the preset preserves an existing
+compatible schedule, including an operator's enabled state and cron changes;
+incompatible resources using the reserved names produce `409 Conflict`.
 
 Delivery ack:
 

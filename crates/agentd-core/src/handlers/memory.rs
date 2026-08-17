@@ -1,6 +1,17 @@
 use crate::CapabilityEngine;
 use anyhow::{anyhow, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryListCursor {
+    version: u8,
+    tenant: String,
+    namespace: String,
+    after_id: String,
+}
 
 fn required<'a>(params: &'a Value, field: &str) -> Result<&'a str> {
     params
@@ -18,6 +29,34 @@ fn namespace(params: &Value) -> &str {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("default")
+}
+
+fn encode_list_cursor(tenant: &str, namespace: &str, after_id: &str) -> Result<String> {
+    let cursor = MemoryListCursor {
+        version: 1,
+        tenant: tenant.to_string(),
+        namespace: namespace.to_string(),
+        after_id: after_id.to_string(),
+    };
+    Ok(URL_SAFE_NO_PAD.encode(serde_json::to_vec(&cursor)?))
+}
+
+fn decode_list_cursor(cursor: &str, tenant: &str, namespace: &str) -> Result<String> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(cursor.trim())
+        .map_err(|_| anyhow!("invalid memory_list cursor"))?;
+    let cursor: MemoryListCursor =
+        serde_json::from_slice(&bytes).map_err(|_| anyhow!("invalid memory_list cursor"))?;
+    if cursor.version != 1
+        || cursor.tenant != tenant
+        || cursor.namespace != namespace
+        || cursor.after_id.trim().is_empty()
+    {
+        return Err(anyhow!(
+            "memory_list cursor does not match the current tenant and namespace"
+        ));
+    }
+    Ok(cursor.after_id)
 }
 
 impl CapabilityEngine {
@@ -43,6 +82,30 @@ impl CapabilityEngine {
             )
             .await?;
         Ok(json!({"matches":matches}))
+    }
+
+    pub(crate) async fn execute_memory_list(&self, tenant: &str, params: &Value) -> Result<Value> {
+        let namespace = namespace(params);
+        let after_id = params
+            .get("cursor")
+            .and_then(Value::as_str)
+            .map(|cursor| decode_list_cursor(cursor, tenant, namespace))
+            .transpose()?;
+        let page = self
+            .store
+            .list_memory_page(
+                tenant,
+                namespace,
+                after_id.as_deref(),
+                params.get("limit").and_then(Value::as_u64).unwrap_or(50) as usize,
+            )
+            .await?;
+        let next_cursor = page
+            .next_after_id
+            .as_deref()
+            .map(|after_id| encode_list_cursor(tenant, namespace, after_id))
+            .transpose()?;
+        Ok(json!({"items":page.items,"next_cursor":next_cursor}))
     }
 
     pub async fn search_memory(
@@ -173,5 +236,53 @@ mod tests {
             .unwrap();
         assert_eq!(clamped.len(), 20);
         assert_eq!(clamped[0].id, "fact-00");
+    }
+
+    #[tokio::test]
+    async fn memory_list_cursor_is_bound_to_tenant_and_namespace() {
+        let (_directory, store, engine) = engine(|_| Ok(embedding())).await;
+        store.create_tenant("other", &json!({})).await.unwrap();
+        let vector = embedding();
+        for id in ["alpha", "bravo", "charlie"] {
+            store
+                .put_memory("demo", "profile", id, &format!("fact {id}"), &vector)
+                .await
+                .unwrap();
+        }
+
+        let first = engine
+            .execute_memory_list("demo", &json!({"namespace":"profile","limit":2}))
+            .await
+            .unwrap();
+        assert_eq!(first["items"].as_array().unwrap().len(), 2);
+        assert_eq!(first["items"][0]["id"], "alpha");
+        assert!(first["items"][0].get("tenant").is_none());
+        assert!(first["items"][0].get("namespace").is_none());
+        assert!(first["items"][0].get("embedding").is_none());
+        let cursor = first["next_cursor"].as_str().unwrap();
+
+        let second = engine
+            .execute_memory_list(
+                "demo",
+                &json!({"namespace":"profile","limit":2,"cursor":cursor}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second["items"][0]["id"], "charlie");
+        assert!(second["next_cursor"].is_null());
+
+        for invalid in [
+            engine
+                .execute_memory_list("demo", &json!({"namespace":"other","cursor":cursor}))
+                .await,
+            engine
+                .execute_memory_list("other", &json!({"namespace":"profile","cursor":cursor}))
+                .await,
+            engine
+                .execute_memory_list("demo", &json!({"namespace":"profile","cursor":"bad"}))
+                .await,
+        ] {
+            assert!(invalid.is_err());
+        }
     }
 }

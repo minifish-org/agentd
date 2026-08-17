@@ -4,6 +4,7 @@ pub(crate) mod context;
 pub(crate) mod delivery_outbox;
 pub(crate) mod mcp;
 pub(crate) mod memory;
+pub(crate) mod presets;
 pub(crate) mod runs;
 pub(crate) mod schedules;
 pub(crate) mod tools;
