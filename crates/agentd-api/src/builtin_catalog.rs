@@ -58,7 +58,7 @@ pub fn builtin_tool_catalog() -> Vec<ToolSpec> {
         false,
         json!({"type":"object","required":["query"],"properties":{
             "query":{"type":"string","minLength":1},"namespace":{"type":"string"},
-            "limit":{"type":"integer","minimum":1,"maximum":20}
+            "limit":{"type":"integer","minimum":1,"maximum":5}
         }}),
     );
     add(

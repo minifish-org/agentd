@@ -76,8 +76,9 @@ rejected without changing the stored configuration.
 
 Memory get/search accept optional `namespace`; an agent defaults to its own
 name, while the operator REST defaults to `default`. Search combines FTS5 and
-semantic ranks and returns a positive fused `score`; its default limit is 5 and
-maximum is 20. Writes are available only to agents through
+E5 semantic ranks with RRF, reranks the top 10 original texts with BGE v2-m3,
+and returns a positive normalized relevance `score`; its default and maximum
+limit are 5. Writes are available only to agents through
 `memory_put`/`memory_delete` and fail atomically when embedding fails.
 
 The agent-only `memory_list` tool enumerates one namespace in ID order. Its

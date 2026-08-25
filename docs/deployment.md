@@ -2,11 +2,12 @@
 
 agentd deployments replace runtime data rather than migrate it.
 
-The deployment image includes the pinned multilingual E5 Small ONNX and
-tokenizer assets. Startup verifies every asset checksum, loads the model, and
-runs one inference before accepting traffic. There is no runtime embedding
-network dependency or alternate provider. The image also includes the model's
-MIT license beside its assets and the repository's `THIRD_PARTY_NOTICES.md`.
+The deployment image includes pinned INT8 ONNX and tokenizer assets for
+multilingual E5 Small and BGE reranker v2-m3. Startup verifies every asset
+checksum, loads both models, and runs inference before accepting traffic. There
+is no runtime retrieval network dependency or alternate provider. The image
+also includes both model licenses beside their assets and the repository's
+`THIRD_PARTY_NOTICES.md`.
 
 1. Stop the local agentd service.
 2. Atomically rename the existing data directory as a short-lived rollback
@@ -23,18 +24,22 @@ MIT license beside its assets and the repository's `THIRD_PARTY_NOTICES.md`.
 If startup reports a schema mismatch, use `agentd --reset-data`; do not add an
 ALTER, backfill, repair endpoint, or legacy parser.
 
-Native development may set `AGENTD_EMBEDDING_MODEL_DIR` to the directory that
-contains the pinned assets. This changes only their filesystem location;
-checksums prevent it from selecting a different model. Production images use
-`/opt/agentd/models/multilingual-e5-small`.
+Native development may set `AGENTD_EMBEDDING_MODEL_DIR` and
+`AGENTD_RERANKER_MODEL_DIR` to directories containing the pinned assets. This
+changes only their filesystem locations; checksums prevent selecting different
+models. Production images use `/opt/agentd/models/multilingual-e5-small` and
+`/opt/agentd/models/bge-reranker-v2-m3`.
 
 For a fresh native checkout, install and verify the pinned files before the
 first start:
 
 ```sh
 agentd_model_dir="$HOME/.cache/agentd/models/multilingual-e5-small"
+agentd_reranker_dir="$HOME/.cache/agentd/models/bge-reranker-v2-m3"
 ./scripts/fetch-embedding-model.sh "$agentd_model_dir"
+./scripts/fetch-reranker-model.sh "$agentd_reranker_dir"
 export AGENTD_EMBEDDING_MODEL_DIR="$agentd_model_dir"
+export AGENTD_RERANKER_MODEL_DIR="$agentd_reranker_dir"
 ```
 
 For a local container smoke test, `configs/agentd.docker.toml` provides a

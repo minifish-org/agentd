@@ -2,7 +2,8 @@ use crate::CapabilityEngine;
 use agentd_store::MEMORY_EMBEDDING_DIM;
 use anyhow::{anyhow, Context, Result};
 use fastembed::{
-    InitOptionsUserDefined, Pooling, TextEmbedding, TokenizerFiles, UserDefinedEmbeddingModel,
+    InitOptionsUserDefined, Pooling, QuantizationMode, TextEmbedding, TokenizerFiles,
+    UserDefinedEmbeddingModel,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -13,6 +14,8 @@ use tokenizers::Tokenizer;
 
 pub const BUILTIN_EMBEDDING_MODEL_ID: &str =
     "intfloat/multilingual-e5-small@614241f622f53c4eeff9890bdc4f31cfecc418b3";
+pub const BUILTIN_EMBEDDING_ARTIFACT_ID: &str =
+    "Xenova/multilingual-e5-small@761b726dd34fb83930e26aab4e9ac3899aa1fa78/onnx/model_int8.onnx";
 pub const BUILTIN_EMBEDDING_DIMENSION: usize = MEMORY_EMBEDDING_DIM;
 
 const MODEL_DIR_ENV: &str = "AGENTD_EMBEDDING_MODEL_DIR";
@@ -22,11 +25,11 @@ const MODEL_THREADS: usize = 2;
 const MODEL_ASSETS: [(&str, &str); 5] = [
     (
         "config.json",
-        "69137736cab8b8903a07fe8afaafdda25aac55415a12a55d1bffa9f581abf959",
+        "cb99455288675345e1a4f411438d5d0adbba5fbd3a67ea4fb03c015433b996c1",
     ),
     (
-        "onnx/model.onnx",
-        "ca456c06b3a9505ddfd9131408916dd79290368331e7d76bb621f1cba6bc8665",
+        "onnx/model_int8.onnx",
+        "4d24e2bc01a447951524466ef533e52944bf48509e6552810bcee1a2711cb02c",
     ),
     (
         "special_tokens_map.json",
@@ -66,7 +69,7 @@ impl LoadedEmbedding {
     fn load() -> Result<Self> {
         let directory = model_directory();
         let config_file = read_verified_asset(&directory, "config.json")?;
-        let onnx_file = read_verified_asset(&directory, "onnx/model.onnx")?;
+        let onnx_file = read_verified_asset(&directory, "onnx/model_int8.onnx")?;
         let special_tokens_map_file = read_verified_asset(&directory, "special_tokens_map.json")?;
         let tokenizer_file = read_verified_asset(&directory, "tokenizer.json")?;
         let tokenizer_config_file = read_verified_asset(&directory, "tokenizer_config.json")?;
@@ -77,7 +80,9 @@ impl LoadedEmbedding {
             special_tokens_map_file,
             tokenizer_config_file,
         };
-        let model = UserDefinedEmbeddingModel::new(onnx_file, files).with_pooling(Pooling::Mean);
+        let model = UserDefinedEmbeddingModel::new(onnx_file, files)
+            .with_pooling(Pooling::Mean)
+            .with_quantization(QuantizationMode::Dynamic);
         let model = TextEmbedding::try_new_from_user_defined(
             model,
             InitOptionsUserDefined::new()

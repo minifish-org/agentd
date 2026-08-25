@@ -14,6 +14,10 @@ not preserved unless a release note explicitly says otherwise.
 
 ### Changed
 
+- Memory retrieval now uses INT8 multilingual E5 Small embeddings, fuses BM25
+  and semantic candidates with RRF to top 10, then applies an INT8 BGE
+  reranker-v2-m3 cross-encoder and returns at most the top 5. The database
+  remains one 384-dimension embedding per memory row.
 - Memory-maintenance agents now use `standard/chat`; the native loop requires
   them to complete tenant-bound `memory_list` pagination before reporting
   success or modifying memory.

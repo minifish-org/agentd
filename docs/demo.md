@@ -7,15 +7,15 @@ result, inspects its trace, verifies pull-only delivery behavior, and exercises
 artifact storage.
 
 Requirements are Rust, Python 3, `curl`, and `jq`. The first run also downloads
-about 448 MiB of checksum-verified embedding assets and compiles the workspace.
+about 690 MiB of checksum-verified retrieval assets and compiles the workspace.
 
 ```sh
 ./scripts/demo-e2e.sh
 ```
 
-The script reuses valid embedding assets from
-`$AGENTD_EMBEDDING_MODEL_DIR` or
-`$HOME/.cache/agentd/models/multilingual-e5-small`. Runtime state and logs live
+The script reuses valid E5 and reranker assets from
+`$AGENTD_EMBEDDING_MODEL_DIR` / `$AGENTD_RERANKER_MODEL_DIR`, or their
+directories under `$HOME/.cache/agentd/models`. Runtime state and logs live
 in a temporary directory; log excerpts are printed on failure and the directory
 is removed on exit. Set
 `AGENTD_DEMO_PROVIDER_PORT` or `AGENTD_DEMO_PORT` only when fixed ports are

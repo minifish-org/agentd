@@ -1,12 +1,17 @@
-FROM debian:trixie-slim AS embedding-model
+FROM debian:trixie-slim AS retrieval-models
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 COPY scripts/fetch-embedding-model.sh /usr/local/bin/fetch-embedding-model
+COPY scripts/fetch-reranker-model.sh /usr/local/bin/fetch-reranker-model
 COPY licenses/multilingual-e5-small.LICENSE /usr/local/share/agentd/multilingual-e5-small.LICENSE
+COPY LICENSE /usr/local/share/agentd/bge-reranker-v2-m3.LICENSE
 RUN /usr/local/bin/fetch-embedding-model \
     /models/multilingual-e5-small \
-    /usr/local/share/agentd/multilingual-e5-small.LICENSE
+    /usr/local/share/agentd/multilingual-e5-small.LICENSE \
+    && /usr/local/bin/fetch-reranker-model \
+    /models/bge-reranker-v2-m3 \
+    /usr/local/share/agentd/bge-reranker-v2-m3.LICENSE
 
 FROM rust:1.92-trixie AS builder
 WORKDIR /src
@@ -28,7 +33,8 @@ RUN apt-get update \
     && mkdir -p /etc/agentd /var/lib/agentd /opt/agentd/models \
     && chown -R agentd:agentd /var/lib/agentd
 COPY --from=builder /tmp/agentd /usr/local/bin/agentd
-COPY --from=embedding-model /models/multilingual-e5-small /opt/agentd/models/multilingual-e5-small
+COPY --from=retrieval-models /models/multilingual-e5-small /opt/agentd/models/multilingual-e5-small
+COPY --from=retrieval-models /models/bge-reranker-v2-m3 /opt/agentd/models/bge-reranker-v2-m3
 COPY LICENSE THIRD_PARTY_NOTICES.md /usr/share/doc/agentd/
 ENV AGENTD_CONFIG=/etc/agentd/agentd.toml
 EXPOSE 8080

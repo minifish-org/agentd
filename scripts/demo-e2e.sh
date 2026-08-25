@@ -16,6 +16,7 @@ free_port() {
 provider_port=${AGENTD_DEMO_PROVIDER_PORT:-$(free_port)}
 agentd_port=${AGENTD_DEMO_PORT:-$(free_port)}
 model_dir=${AGENTD_EMBEDDING_MODEL_DIR:-"$HOME/.cache/agentd/models/multilingual-e5-small"}
+reranker_dir=${AGENTD_RERANKER_MODEL_DIR:-"$HOME/.cache/agentd/models/bge-reranker-v2-m3"}
 work_dir=$(mktemp -d "${TMPDIR:-/tmp}/agentd-demo.XXXXXX")
 provider_pid=
 agentd_pid=
@@ -42,6 +43,7 @@ cleanup() {
 trap cleanup EXIT
 
 "$root/scripts/fetch-embedding-model.sh" "$model_dir"
+"$root/scripts/fetch-reranker-model.sh" "$reranker_dir"
 
 python3 "$root/scripts/demo-openai-provider.py" --port "$provider_port" \
   >"$work_dir/provider.log" 2>&1 &
@@ -69,6 +71,7 @@ printf '%s\n' \
   >"$work_dir/agentd.toml"
 
 AGENTD_EMBEDDING_MODEL_DIR="$model_dir" \
+AGENTD_RERANKER_MODEL_DIR="$reranker_dir" \
   cargo run --quiet --manifest-path "$root/Cargo.toml" -p agentd -- \
   --config "$work_dir/agentd.toml" --reset-data \
   >"$work_dir/agentd.log" 2>&1 &

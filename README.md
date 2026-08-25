@@ -31,9 +31,10 @@ claim run → read context → native model/tool loop
 
 The database has tenants, agents, runs, run log, contexts, artifacts, memory,
 schedules, deliveries, and MCP servers. Memory is one table with one FTS5
-index and one embedding BLOB per fact; exact cosine and lexical ranks are
-combined with RRF. Replay is exactly the stored `run_log`; there is no derived replay,
-audit, inspection, simulation, or export control plane.
+index and one 384-dimension embedding BLOB per fact. Exact cosine and lexical
+ranks are combined with RRF; its top 10 are reranked to a final top 5. Replay
+is exactly the stored `run_log`; there is no derived replay, audit, inspection,
+simulation, or export control plane.
 
 ## Start
 
@@ -46,20 +47,23 @@ turn lifecycle against a loopback-only OpenAI-compatible fixture:
 ./scripts/demo-e2e.sh
 ```
 
-The first run downloads about 448 MiB of checksum-verified embedding assets.
+The first run downloads about 690 MiB of checksum-verified retrieval assets.
 The fixture proves the runtime/API path, not model quality or real tool-call
 compatibility. See the [demo boundary](docs/demo.md) for details.
 
 ### Native
 
-Native startup requires the pinned embedding assets. The fetch script downloads
-only the fixed revision, verifies every checksum, and installs the model's MIT
-license. It supports both GNU `sha256sum` and the `shasum` included with macOS.
+Native startup requires the pinned E5 and BGE reranker assets. The fetch scripts
+download only fixed revisions, verify every checksum, and install the models'
+licenses. They support both GNU `sha256sum` and the `shasum` included with macOS.
 
 ```sh
 agentd_model_dir="${AGENTD_EMBEDDING_MODEL_DIR:-$HOME/.cache/agentd/models/multilingual-e5-small}"
+agentd_reranker_dir="${AGENTD_RERANKER_MODEL_DIR:-$HOME/.cache/agentd/models/bge-reranker-v2-m3}"
 ./scripts/fetch-embedding-model.sh "$agentd_model_dir"
+./scripts/fetch-reranker-model.sh "$agentd_reranker_dir"
 export AGENTD_EMBEDDING_MODEL_DIR="$agentd_model_dir"
+export AGENTD_RERANKER_MODEL_DIR="$agentd_reranker_dir"
 
 cp configs/agentd.toml ~/.agentd.toml
 # Edit ~/.agentd.toml to point at an OpenAI-compatible chat-completions API.
@@ -135,10 +139,13 @@ approval workflow. Shell, arbitrary HTTP, audio, run, plan, LLM, output,
 dialog, and context tools do not exist.
 
 Memory writes embed the concise canonical text before committing it. The
-runtime contains one pinned `intfloat/multilingual-e5-small` ONNX model and
-does not call an external embedding provider or silently fall back to
-lexical-only results. Queries use the E5 `query:` prefix and facts use
-`passage:`; inputs over 512 model tokens are rejected in favor of artifacts.
+runtime contains pinned INT8 ONNX builds of `intfloat/multilingual-e5-small`
+and `BAAI/bge-reranker-v2-m3`; it does not call an external retrieval provider
+or silently fall back to lexical-only results. Queries use the E5 `query:`
+prefix and facts use `passage:`; inputs over 512 E5 tokens are rejected in
+favor of artifacts. Search fuses BM25 and E5 ranks with RRF, passes only the
+top 10 original texts to BGE in one batch, then returns at most the reranked
+top 5. The reranker stores no vectors or other database state.
 The model decides when to search or write memory, and those actions remain
 ordinary traced tool calls.
 
@@ -199,5 +206,5 @@ contribution guide.
 ## License
 
 Licensed under the [Apache License 2.0](LICENSE).
-The bundled embedding model remains under its upstream MIT license; see
+The bundled models remain under their upstream MIT and Apache-2.0 licenses; see
 [third-party notices](THIRD_PARTY_NOTICES.md).

@@ -72,7 +72,7 @@ pub(crate) async fn run_server(config_path: &str, reset_data: bool) -> Result<()
             default_chat_system_prompt: cfg.default_chat_system_prompt.clone(),
         },
     );
-    caps.warm_up_embedding().await?;
+    caps.warm_up_retrieval_models().await?;
 
     let runtime = RuntimeEngine::new(caps.clone(), store.clone());
     let scheduler = Scheduler::new(

@@ -29,6 +29,8 @@ reader can distinguish tested properties from design intent.
 | Schema mismatch requires explicit data reset | `schema_version_mismatch_requires_data_reset` | Store integration test |
 | A non-loopback listener requires a non-empty API token | `non_loopback_listener_requires_non_empty_api_token`; `non_loopback_listener_accepts_api_token`; `loopback_listener_allows_missing_api_token` | Configuration tests |
 | The pinned E5 model produces normalized 384-dimension vectors | `pinned_model_generates_normalized_384_dimension_vectors` | Real-model smoke test; ignored by default |
+| RRF candidates are capped at 10, BGE reranking changes their order, and output is capped at 5 | `memory_search_reranks_only_the_rrf_top_ten` | Core integration test with deterministic embedding and reranker scores |
+| The pinned BGE v2-m3 model scores a relevant multilingual passage above an unrelated one | `pinned_model_reranks_multilingual_documents` | Real-model smoke test; ignored by default |
 | The deterministic demo provider returns a final response accepted by the native loop contract | `scripts/test-demo-provider.sh` | Loopback protocol smoke test |
 
 Test names are stable documentation targets only while the behavior remains in
@@ -50,7 +52,7 @@ bash scripts/test_deployment.sh
 
 The deterministic end-to-end demo exercises a real agentd process without an
 LLM credential. It is intentionally separate from the default suite because it
-loads the embedding model and starts local processes:
+loads both retrieval models and starts local processes:
 
 ```sh
 ./scripts/demo-e2e.sh
@@ -58,19 +60,26 @@ loads the embedding model and starts local processes:
 
 See the [demo boundary](demo.md) for what this fixture does and does not prove.
 
-The real embedding smoke test requires the pinned assets:
+The real retrieval smoke tests require the pinned assets:
 
 ```sh
 model_dir="${AGENTD_EMBEDDING_MODEL_DIR:-$HOME/.cache/agentd/models/multilingual-e5-small}"
+reranker_dir="${AGENTD_RERANKER_MODEL_DIR:-$HOME/.cache/agentd/models/bge-reranker-v2-m3}"
 ./scripts/fetch-embedding-model.sh "$model_dir"
+./scripts/fetch-reranker-model.sh "$reranker_dir"
 AGENTD_EMBEDDING_MODEL_DIR="$model_dir" \
+AGENTD_RERANKER_MODEL_DIR="$reranker_dir" \
   cargo test -p agentd-core \
   pinned_model_generates_normalized_384_dimension_vectors -- --ignored
+AGENTD_EMBEDDING_MODEL_DIR="$model_dir" \
+AGENTD_RERANKER_MODEL_DIR="$reranker_dir" \
+  cargo test -p agentd-core \
+  pinned_model_reranks_multilingual_documents -- --ignored
 ```
 
 Dependency advisory, dependency-license/source, and current-tree secret checks
 run in the `Security` GitHub Actions workflow. The manual and tag-triggered
-`Release check` workflow runs the real embedding smoke test and builds and
+`Release check` workflow runs both real retrieval smoke tests and builds and
 inspects the complete container image in addition to the default checks.
 
 ## Evidence not yet present

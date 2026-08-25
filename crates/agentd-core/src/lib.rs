@@ -8,13 +8,17 @@ mod embedding_provider;
 mod handlers;
 mod llm_provider;
 mod mcp_client;
+mod reranking_provider;
 mod storage;
 mod time_utils;
 
 mod runtime;
 
-pub use embedding_provider::{BUILTIN_EMBEDDING_DIMENSION, BUILTIN_EMBEDDING_MODEL_ID};
+pub use embedding_provider::{
+    BUILTIN_EMBEDDING_ARTIFACT_ID, BUILTIN_EMBEDDING_DIMENSION, BUILTIN_EMBEDDING_MODEL_ID,
+};
 pub use mcp_client::discover_tools as discover_mcp_tools;
+pub use reranking_provider::{BUILTIN_RERANKER_ARTIFACT_ID, BUILTIN_RERANKER_MODEL_ID};
 pub use runtime::{ExecutionReport, RuntimeEngine};
 
 const DEFAULT_CHAT_SYSTEM_PROMPT: &str = "You are a transport-neutral agent. \
@@ -100,6 +104,7 @@ pub struct CapabilityEngine {
     llm_api_key: Option<String>,
     llm_model: Option<String>,
     embedding: embedding_provider::BuiltInEmbedding,
+    reranker: reranking_provider::BuiltInReranker,
     default_chat_system_prompt: Option<String>,
 }
 
@@ -147,6 +152,7 @@ impl CapabilityEngine {
             llm_api_key: cfg.llm_api_key,
             llm_model: cfg.llm_model,
             embedding: embedding_provider::BuiltInEmbedding::default(),
+            reranker: reranking_provider::BuiltInReranker::default(),
             default_chat_system_prompt: cfg.default_chat_system_prompt,
         }
     }

@@ -47,7 +47,9 @@ little-endian f32 embedding share the same row; one FTS5 index follows the text
 with triggers. Schema v6 is bound to the pinned multilingual E5 Small model;
 changing that model requires a schema bump and data reset. Search scans vectors
 only inside the selected tenant/namespace and fuses semantic and lexical ranks
-with RRF. There are no dynamic RAG tables, vector metadata resources,
+with RRF. A pinned INT8 BGE v2-m3 cross-encoder reranks the RRF top 10 from the
+query and original text, and the API returns at most the top 5. The reranker
+persists no vectors. There are no dynamic RAG tables, vector metadata resources,
 automatic recall, or automatic writes.
 
 Enumeration uses bounded keyset pages over one tenant and namespace. The

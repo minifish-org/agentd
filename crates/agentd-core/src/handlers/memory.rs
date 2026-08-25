@@ -4,6 +4,9 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+const MEMORY_RRF_CANDIDATE_LIMIT: usize = 10;
+const MEMORY_RESULT_LIMIT: usize = 5;
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MemoryListCursor {
@@ -120,9 +123,19 @@ impl CapabilityEngine {
             return Err(anyhow!("memory query is required"));
         }
         let embedding = self.embed_query(query).await?;
-        self.store
-            .search_memory(tenant, namespace, query, &embedding, limit)
-            .await
+        let candidates = self
+            .store
+            .search_memory(
+                tenant,
+                namespace,
+                query,
+                &embedding,
+                MEMORY_RRF_CANDIDATE_LIMIT,
+            )
+            .await?;
+        let mut reranked = self.rerank_memory(query, candidates).await?;
+        reranked.truncate(limit.clamp(1, MEMORY_RESULT_LIMIT));
+        Ok(reranked)
     }
 
     pub(crate) async fn execute_memory_put(&self, tenant: &str, params: &Value) -> Result<Value> {
@@ -184,7 +197,10 @@ mod tests {
         store.create_tenant("demo", &json!({})).await.unwrap();
         let engine =
             CapabilityEngine::new_with_config(store.clone(), CapabilityEngineConfig::default())
-                .with_test_embedding(embed);
+                .with_test_embedding(embed)
+                .with_test_reranker(|_, documents| {
+                    Ok((0..documents.len()).map(|index| -(index as f32)).collect())
+                });
         (directory, store, engine)
     }
 
@@ -234,8 +250,60 @@ mod tests {
             .search_memory("demo", "profile", "unrelated paraphrase", 100)
             .await
             .unwrap();
-        assert_eq!(clamped.len(), 20);
+        assert_eq!(clamped.len(), 5);
         assert_eq!(clamped[0].id, "fact-00");
+    }
+
+    #[tokio::test]
+    async fn memory_search_reranks_only_the_rrf_top_ten() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = AgentdStore::new(directory.path().join("agentd.db").to_str().unwrap())
+            .await
+            .unwrap();
+        store.create_tenant("demo", &json!({})).await.unwrap();
+        let engine =
+            CapabilityEngine::new_with_config(store.clone(), CapabilityEngineConfig::default())
+                .with_test_embedding(|_| Ok(embedding()))
+                .with_test_reranker(|query, documents| {
+                    assert_eq!(query, "query");
+                    assert_eq!(documents.len(), 10);
+                    Ok(documents
+                        .iter()
+                        .map(|document| {
+                            document
+                                .split_whitespace()
+                                .last()
+                                .unwrap()
+                                .parse::<f32>()
+                                .unwrap()
+                        })
+                        .collect())
+                });
+        let vector = embedding();
+        for index in 0..15 {
+            store
+                .put_memory(
+                    "demo",
+                    "profile",
+                    &format!("fact-{index:02}"),
+                    &format!("candidate {index}"),
+                    &vector,
+                )
+                .await
+                .unwrap();
+        }
+
+        let matches = engine
+            .search_memory("demo", "profile", "query", 5)
+            .await
+            .unwrap();
+        assert_eq!(matches.len(), 5);
+        assert_eq!(matches[0].id, "fact-09");
+        assert_eq!(matches[4].id, "fact-05");
+        assert!(matches.iter().all(|item| {
+            item.score
+                .is_some_and(|score| score.is_finite() && score > 0.0 && score <= 1.0)
+        }));
     }
 
     #[tokio::test]

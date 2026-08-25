@@ -125,7 +125,7 @@ The implementation is designed to preserve these properties:
 - delivery claims use random tokens, expiry, and token-checked acknowledgement;
 - MCP catalogs, allowlists, and secret references are tenant-scoped;
 - the container runs as a non-root user;
-- embedding assets are pinned by revision and SHA-256 before use.
+- retrieval model assets are pinned by revision and SHA-256 before use.
 
 These properties are covered by tests where practical, but they are not a
 substitute for deployment isolation and credential hygiene.

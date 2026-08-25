@@ -20,6 +20,7 @@ jobs:
     env:
       CARGO_INCREMENTAL: "0"
       AGENTD_EMBEDDING_MODEL_DIR: ${{ github.workspace }}/.release-model/multilingual-e5-small
+      AGENTD_RERANKER_MODEL_DIR: ${{ github.workspace }}/.release-model/bge-reranker-v2-m3
     steps:
       - uses: actions/checkout@v7
       - uses: actions/cache@v6
@@ -29,7 +30,8 @@ jobs:
             ~/.cargo/git
             build
             .release-model/multilingual-e5-small
-          key: release-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'scripts/fetch-embedding-model.sh') }}
+            .release-model/bge-reranker-v2-m3
+          key: release-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'scripts/fetch-embedding-model.sh', 'scripts/fetch-reranker-model.sh') }}
 
       - name: Validate release version
         id: version
@@ -52,10 +54,18 @@ jobs:
       - name: Fetch pinned embedding assets
         run: ./scripts/fetch-embedding-model.sh "$AGENTD_EMBEDDING_MODEL_DIR"
 
+      - name: Fetch pinned reranker assets
+        run: ./scripts/fetch-reranker-model.sh "$AGENTD_RERANKER_MODEL_DIR"
+
       - name: Run real embedding smoke test
         run: |
           cargo test -p agentd-core \
             pinned_model_generates_normalized_384_dimension_vectors -- --ignored
+
+      - name: Run real reranker smoke test
+        run: |
+          cargo test -p agentd-core \
+            pinned_model_reranks_multilingual_documents -- --ignored
 
       - name: Build and inspect release image
         run: |
@@ -71,4 +81,5 @@ jobs:
             test -f /usr/share/doc/agentd/LICENSE
             test -f /usr/share/doc/agentd/THIRD_PARTY_NOTICES.md
             test -f /opt/agentd/models/multilingual-e5-small/LICENSE
+            test -f /opt/agentd/models/bge-reranker-v2-m3/LICENSE
           '

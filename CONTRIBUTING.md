@@ -20,16 +20,19 @@ Security reports do not belong in public issues. Follow
 
 The workspace pins Rust 1.92 through `rust-toolchain.toml`. Native runtime use
 also needs `curl`, an OpenAI-compatible chat-completions provider, and the
-pinned embedding assets:
+pinned retrieval assets:
 
 ```sh
 model_dir="${AGENTD_EMBEDDING_MODEL_DIR:-$HOME/.cache/agentd/models/multilingual-e5-small}"
+reranker_dir="${AGENTD_RERANKER_MODEL_DIR:-$HOME/.cache/agentd/models/bge-reranker-v2-m3}"
 ./scripts/fetch-embedding-model.sh "$model_dir"
+./scripts/fetch-reranker-model.sh "$reranker_dir"
 export AGENTD_EMBEDDING_MODEL_DIR="$model_dir"
+export AGENTD_RERANKER_MODEL_DIR="$reranker_dir"
 ```
 
 The default test suite does not call a live LLM provider and does not require
-the embedding model. See the [README](README.md) for native and Docker startup.
+the retrieval models. See the [README](README.md) for native and Docker startup.
 
 ## Required checks
 
@@ -45,7 +48,7 @@ bash scripts/test_deployment.sh
 docker build --check .
 ```
 
-Changes to embedding behavior must also run the ignored real-model test shown
+Changes to retrieval behavior must also run the ignored real-model tests shown
 in [`docs/reliability.md`](docs/reliability.md). Changes to dependencies must
 pass the repository's `cargo deny` policy. CI and Security workflows rerun the
 applicable checks on pull requests.
