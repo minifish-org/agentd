@@ -12,7 +12,7 @@ use libsql::{Builder, Connection, Database, Value};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -23,6 +23,14 @@ use db::{LibsqlPool, Row};
 
 pub const MAX_MEMORY_TEXT_BYTES: usize = 4096;
 pub const MEMORY_EMBEDDING_DIM: usize = 384;
+pub const MAX_GRAPH_ENTITIES_PER_MEMORY: usize = 32;
+pub const MAX_GRAPH_EDGES_PER_MEMORY: usize = 64;
+
+const MAX_GRAPH_ID_BYTES: usize = 200;
+const MAX_GRAPH_LABEL_BYTES: usize = 500;
+const MAX_GRAPH_RELATION_BYTES: usize = 200;
+const MAX_GRAPH_PROPERTIES_BYTES: usize = 4096;
+const MAX_GRAPH_WALK_ROWS: i64 = 10_000;
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct TenantRecord {
@@ -666,6 +674,80 @@ pub struct MemoryPage {
     pub next_after_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryGraphInput {
+    #[serde(default)]
+    pub entities: Vec<GraphEntityInput>,
+    #[serde(default)]
+    pub edges: Vec<GraphEdgeInput>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct GraphEntityInput {
+    pub id: String,
+    pub label: String,
+    #[serde(default, rename = "type")]
+    pub kind: Option<String>,
+    #[serde(default = "empty_json_object")]
+    pub properties: serde_json::Value,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct GraphEdgeInput {
+    pub from: String,
+    pub relation: String,
+    pub to: String,
+    #[serde(default = "empty_json_object")]
+    pub properties: serde_json::Value,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct GraphEntity {
+    pub id: String,
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "type")]
+    pub kind: Option<String>,
+    pub properties: serde_json::Value,
+    pub memory_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct GraphPathEdge {
+    pub from: String,
+    pub relation: String,
+    pub to: String,
+    pub memory_id: String,
+    pub properties: serde_json::Value,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct GraphPath {
+    pub hops: usize,
+    pub nodes: Vec<String>,
+    pub edges: Vec<GraphPathEdge>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct GraphQueryResult {
+    pub entities: Vec<GraphEntity>,
+    pub paths: Vec<GraphPath>,
+}
+
+pub struct GraphQuery<'a> {
+    pub entity: &'a str,
+    pub relation: Option<&'a str>,
+    pub direction: &'a str,
+    pub max_hops: usize,
+    pub limit: usize,
+}
+
+fn empty_json_object() -> serde_json::Value {
+    json!({})
+}
+
 #[derive(Debug)]
 struct SemanticMemoryHit {
     similarity: f64,
@@ -1051,6 +1133,26 @@ impl AgentdStore {
         text: &str,
         embedding: &[f32],
     ) -> Result<MemoryItem> {
+        self.put_memory_with_graph(
+            tenant,
+            namespace,
+            id,
+            text,
+            embedding,
+            &MemoryGraphInput::default(),
+        )
+        .await
+    }
+
+    pub async fn put_memory_with_graph(
+        &self,
+        tenant: &str,
+        namespace: &str,
+        id: &str,
+        text: &str,
+        embedding: &[f32],
+        graph: &MemoryGraphInput,
+    ) -> Result<MemoryItem> {
         self.ensure_tenant_exists(tenant).await?;
         let namespace = normalize_memory_component(namespace, "namespace")?;
         let id = normalize_memory_component(id, "id")?;
@@ -1064,8 +1166,10 @@ impl AgentdStore {
             ));
         }
         validate_memory_embedding(embedding)?;
+        let graph = normalize_memory_graph(graph)?;
         let embedding = encode_memory_embedding(embedding);
         let now = Utc::now().to_rfc3339();
+        let mut tx = self.pool.begin().await?;
         db::query(
             "INSERT INTO memory (tenant, namespace, id, text, embedding, created_at, updated_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?) \
@@ -1079,8 +1183,57 @@ impl AgentdStore {
         .bind(embedding)
         .bind(&now)
         .bind(&now)
-        .execute(&self.pool)
+        .execute(&mut tx)
         .await?;
+
+        db::query("DELETE FROM edges WHERE tenant = ? AND namespace = ? AND memory_id = ?")
+            .bind(tenant)
+            .bind(&namespace)
+            .bind(&id)
+            .execute(&mut tx)
+            .await?;
+        db::query("DELETE FROM entities WHERE tenant = ? AND namespace = ? AND memory_id = ?")
+            .bind(tenant)
+            .bind(&namespace)
+            .bind(&id)
+            .execute(&mut tx)
+            .await?;
+
+        for entity in &graph.entities {
+            db::query(
+                "INSERT INTO entities (tenant, namespace, memory_id, entity_id, label, entity_type, properties_json, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(tenant)
+            .bind(&namespace)
+            .bind(&id)
+            .bind(&entity.id)
+            .bind(&entity.label)
+            .bind(&entity.kind)
+            .bind(serde_json::to_string(&entity.properties)?)
+            .bind(&now)
+            .bind(&now)
+            .execute(&mut tx)
+            .await?;
+        }
+        for edge in &graph.edges {
+            db::query(
+                "INSERT INTO edges (tenant, namespace, memory_id, source_entity_id, relation, target_entity_id, properties_json, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(tenant)
+            .bind(&namespace)
+            .bind(&id)
+            .bind(&edge.from)
+            .bind(&edge.relation)
+            .bind(&edge.to)
+            .bind(serde_json::to_string(&edge.properties)?)
+            .bind(&now)
+            .bind(&now)
+            .execute(&mut tx)
+            .await?;
+        }
+        tx.commit().await?;
         self.get_memory(tenant, &namespace, &id)
             .await?
             .ok_or_else(|| anyhow!("memory was not readable after put"))
@@ -1097,13 +1250,183 @@ impl AgentdStore {
         Ok(deleted > 0)
     }
 
+    pub async fn query_graph(
+        &self,
+        tenant: &str,
+        namespace: &str,
+        query: GraphQuery<'_>,
+    ) -> Result<GraphQueryResult> {
+        let GraphQuery {
+            entity,
+            relation,
+            direction,
+            max_hops,
+            limit,
+        } = query;
+        self.ensure_tenant_exists(tenant).await?;
+        let namespace = normalize_memory_component(namespace, "namespace")?;
+        let entity = normalize_graph_component(entity, "entity", MAX_GRAPH_LABEL_BYTES)?;
+        let relation = relation
+            .map(|value| normalize_graph_component(value, "relation", MAX_GRAPH_RELATION_BYTES))
+            .transpose()?;
+        if !matches!(direction, "outgoing" | "incoming" | "both") {
+            return Err(anyhow!(
+                "graph direction must be outgoing, incoming, or both"
+            ));
+        }
+        let max_hops = max_hops.clamp(1, 3) as i64;
+        let limit = limit.clamp(1, 100) as i64;
+
+        let start_ids: BTreeSet<String> = db::query_scalar(
+            "SELECT DISTINCT entity_id FROM entities \
+             WHERE tenant = ? AND namespace = ? \
+               AND (entity_id = ? COLLATE NOCASE OR label = ? COLLATE NOCASE) \
+             ORDER BY entity_id ASC LIMIT 16",
+        )
+        .bind(tenant)
+        .bind(&namespace)
+        .bind(&entity)
+        .bind(&entity)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .collect();
+        if start_ids.is_empty() {
+            return Ok(GraphQueryResult {
+                entities: Vec::new(),
+                paths: Vec::new(),
+            });
+        }
+
+        let rows = db::query(
+            r#"WITH RECURSIVE
+               start_nodes(entity_id) AS (
+                   SELECT value FROM json_each(?)
+               ),
+               adjacency(from_id, to_id, edge_from, edge_to, relation, memory_id, properties_json) AS (
+                   SELECT source_entity_id, target_entity_id, source_entity_id, target_entity_id,
+                          relation, memory_id, properties_json
+                   FROM edges
+                   WHERE tenant = ? AND namespace = ? AND ? IN ('outgoing', 'both')
+                     AND (? IS NULL OR relation = ?)
+                   UNION ALL
+                   SELECT target_entity_id, source_entity_id, source_entity_id, target_entity_id,
+                          relation, memory_id, properties_json
+                   FROM edges
+                   WHERE tenant = ? AND namespace = ? AND ? IN ('incoming', 'both')
+                     AND (? IS NULL OR relation = ?)
+               ),
+               walk(depth, current_id, visited, node_path, edge_path) AS (
+                   SELECT 0, entity_id, char(31) || entity_id || char(31),
+                          json_array(entity_id), json_array()
+                   FROM start_nodes
+                   UNION ALL
+                   SELECT walk.depth + 1,
+                          adjacency.to_id,
+                          walk.visited || adjacency.to_id || char(31),
+                          json_insert(walk.node_path, '$[#]', adjacency.to_id),
+                          json_insert(
+                              walk.edge_path,
+                              '$[#]',
+                              json_object(
+                                  'from', adjacency.edge_from,
+                                  'relation', adjacency.relation,
+                                  'to', adjacency.edge_to,
+                                  'memory_id', adjacency.memory_id,
+                                  'properties', json(adjacency.properties_json)
+                              )
+                          )
+                   FROM walk
+                   JOIN adjacency ON adjacency.from_id = walk.current_id
+                   WHERE walk.depth < ?
+                     AND instr(
+                         walk.visited,
+                         char(31) || adjacency.to_id || char(31)
+                     ) = 0
+                   LIMIT ?
+               )
+               SELECT depth, node_path, edge_path
+               FROM walk
+               WHERE depth > 0
+               ORDER BY depth ASC, current_id ASC, node_path ASC
+               LIMIT ?"#,
+        )
+        .bind(serde_json::to_string(&start_ids)?)
+        .bind(tenant)
+        .bind(&namespace)
+        .bind(direction)
+        .bind(&relation)
+        .bind(&relation)
+        .bind(tenant)
+        .bind(&namespace)
+        .bind(direction)
+        .bind(&relation)
+        .bind(&relation)
+        .bind(max_hops)
+        .bind(MAX_GRAPH_WALK_ROWS)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut paths = Vec::with_capacity(rows.len());
+        let mut used_entity_ids = start_ids;
+        for row in rows {
+            let nodes: Vec<String> = serde_json::from_str(&row.try_get::<String, _>("node_path")?)?;
+            let edges: Vec<GraphPathEdge> =
+                serde_json::from_str(&row.try_get::<String, _>("edge_path")?)?;
+            used_entity_ids.extend(nodes.iter().cloned());
+            paths.push(GraphPath {
+                hops: row.try_get::<i64, _>("depth")? as usize,
+                nodes,
+                edges,
+            });
+        }
+        let entity_rows = db::query(
+            "SELECT memory_id, entity_id, label, entity_type, properties_json, updated_at \
+             FROM entities WHERE tenant = ? AND namespace = ? \
+               AND entity_id IN (SELECT value FROM json_each(?)) \
+             ORDER BY updated_at DESC, memory_id ASC",
+        )
+        .bind(tenant)
+        .bind(&namespace)
+        .bind(serde_json::to_string(&used_entity_ids)?)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut entity_index = BTreeMap::<String, GraphEntity>::new();
+        for row in entity_rows {
+            let entity_id = row.try_get::<String, _>("entity_id")?;
+            let memory_id = row.try_get::<String, _>("memory_id")?;
+            if let Some(existing) = entity_index.get_mut(&entity_id) {
+                if !existing.memory_ids.contains(&memory_id) {
+                    existing.memory_ids.push(memory_id);
+                }
+                continue;
+            }
+            entity_index.insert(
+                entity_id.clone(),
+                GraphEntity {
+                    id: entity_id,
+                    label: row.try_get("label")?,
+                    kind: row.try_get("entity_type")?,
+                    properties: serde_json::from_str(
+                        &row.try_get::<String, _>("properties_json")?,
+                    )?,
+                    memory_ids: vec![memory_id],
+                },
+            );
+        }
+        let entities = entity_index.into_values().collect();
+        Ok(GraphQueryResult { entities, paths })
+    }
+
     async fn initialize_schema(&self) -> Result<()> {
-        const SCHEMA_VERSION: i64 = 6;
+        const SCHEMA_VERSION: i64 = 7;
+        const MIGRATABLE_SCHEMA_VERSION: i64 = 6;
         let version = db::query_scalar::<i64>("PRAGMA user_version")
             .fetch_optional(&self.pool)
             .await?
             .unwrap_or(0);
-        if version != 0 && version != SCHEMA_VERSION {
+        if version != 0 && version != MIGRATABLE_SCHEMA_VERSION && version != SCHEMA_VERSION {
             return Err(anyhow!(
                 "agentd schema version {version} is unsupported; restart with --reset-data"
             ));
@@ -1249,13 +1572,59 @@ impl AgentdStore {
             "CREATE INDEX idx_artifacts_tenant_path ON artifacts(tenant, path)",
             "CREATE INDEX idx_deliveries_claim ON deliveries(tenant, status, next_attempt_at, created_at)",
         ];
+        let graph_statements = [
+            r#"CREATE TABLE entities (
+                tenant TEXT NOT NULL,
+                namespace TEXT NOT NULL,
+                memory_id TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                label TEXT NOT NULL,
+                entity_type TEXT,
+                properties_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (tenant, namespace, memory_id, entity_id),
+                FOREIGN KEY (tenant, namespace, memory_id)
+                    REFERENCES memory(tenant, namespace, id) ON DELETE CASCADE
+            )"#,
+            r#"CREATE TABLE edges (
+                tenant TEXT NOT NULL,
+                namespace TEXT NOT NULL,
+                memory_id TEXT NOT NULL,
+                source_entity_id TEXT NOT NULL,
+                relation TEXT NOT NULL,
+                target_entity_id TEXT NOT NULL,
+                properties_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (
+                    tenant, namespace, memory_id,
+                    source_entity_id, relation, target_entity_id
+                ),
+                FOREIGN KEY (tenant, namespace, memory_id)
+                    REFERENCES memory(tenant, namespace, id) ON DELETE CASCADE
+            )"#,
+            "CREATE INDEX idx_entities_lookup ON entities(tenant, namespace, entity_id)",
+            "CREATE INDEX idx_entities_label ON entities(tenant, namespace, label)",
+            "CREATE INDEX idx_edges_outgoing ON edges(tenant, namespace, source_entity_id, relation)",
+            "CREATE INDEX idx_edges_incoming ON edges(tenant, namespace, target_entity_id, relation)",
+        ];
         if version == 0 {
-            for statement in statements {
+            for statement in statements.into_iter().chain(graph_statements) {
                 db::query(statement).execute(&self.pool).await?;
             }
-            db::query("PRAGMA user_version = 6")
+            db::query("PRAGMA user_version = 7")
                 .execute(&self.pool)
                 .await?;
+        } else if version == MIGRATABLE_SCHEMA_VERSION {
+            let mut tx = self.pool.begin().await?;
+            for statement in graph_statements {
+                db::query(statement).execute(&mut tx).await?;
+            }
+            db::query("PRAGMA user_version = 7")
+                .execute(&mut tx)
+                .await?;
+            tx.commit().await?;
         }
         Ok(())
     }
@@ -2410,6 +2779,8 @@ impl AgentdStore {
             "runs",
             "contexts",
             "artifacts",
+            "edges",
+            "entities",
             "memory",
             "schedules",
             "mcp_servers",
@@ -2534,6 +2905,97 @@ fn normalize_memory_component(value: &str, field: &str) -> Result<String> {
         return Err(anyhow!("memory {field} is required"));
     }
     Ok(value.to_string())
+}
+
+fn normalize_graph_component(value: &str, field: &str, max_bytes: usize) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(anyhow!("graph {field} is required"));
+    }
+    if value.len() > max_bytes {
+        return Err(anyhow!("graph {field} exceeds {max_bytes} UTF-8 bytes"));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(anyhow!("graph {field} contains a control character"));
+    }
+    Ok(value.to_string())
+}
+
+fn normalize_graph_properties(
+    properties: &serde_json::Value,
+    field: &str,
+) -> Result<serde_json::Value> {
+    if !properties.is_object() {
+        return Err(anyhow!("graph {field} properties must be an object"));
+    }
+    let encoded = serde_json::to_vec(properties)?;
+    if encoded.len() > MAX_GRAPH_PROPERTIES_BYTES {
+        return Err(anyhow!(
+            "graph {field} properties exceed {MAX_GRAPH_PROPERTIES_BYTES} JSON bytes"
+        ));
+    }
+    Ok(properties.clone())
+}
+
+fn normalize_memory_graph(graph: &MemoryGraphInput) -> Result<MemoryGraphInput> {
+    if graph.entities.len() > MAX_GRAPH_ENTITIES_PER_MEMORY {
+        return Err(anyhow!(
+            "memory graph exceeds {MAX_GRAPH_ENTITIES_PER_MEMORY} entities"
+        ));
+    }
+    if graph.edges.len() > MAX_GRAPH_EDGES_PER_MEMORY {
+        return Err(anyhow!(
+            "memory graph exceeds {MAX_GRAPH_EDGES_PER_MEMORY} edges"
+        ));
+    }
+
+    let mut entity_ids = BTreeSet::new();
+    let mut entities = Vec::with_capacity(graph.entities.len());
+    for entity in &graph.entities {
+        let id = normalize_graph_component(&entity.id, "entity id", MAX_GRAPH_ID_BYTES)?;
+        if !entity_ids.insert(id.clone()) {
+            return Err(anyhow!("memory graph contains duplicate entity id {id}"));
+        }
+        let label =
+            normalize_graph_component(&entity.label, "entity label", MAX_GRAPH_LABEL_BYTES)?;
+        let kind = entity
+            .kind
+            .as_deref()
+            .map(|value| normalize_graph_component(value, "entity type", MAX_GRAPH_ID_BYTES))
+            .transpose()?;
+        entities.push(GraphEntityInput {
+            id,
+            label,
+            kind,
+            properties: normalize_graph_properties(&entity.properties, "entity")?,
+        });
+    }
+
+    let mut edge_keys = BTreeSet::new();
+    let mut edges = Vec::with_capacity(graph.edges.len());
+    for edge in &graph.edges {
+        let from = normalize_graph_component(&edge.from, "edge from", MAX_GRAPH_ID_BYTES)?;
+        let relation =
+            normalize_graph_component(&edge.relation, "edge relation", MAX_GRAPH_RELATION_BYTES)?;
+        let to = normalize_graph_component(&edge.to, "edge to", MAX_GRAPH_ID_BYTES)?;
+        if !entity_ids.contains(&from) || !entity_ids.contains(&to) {
+            return Err(anyhow!(
+                "memory graph edge {from} -[{relation}]-> {to} must reference entities in the same memory graph"
+            ));
+        }
+        if !edge_keys.insert((from.clone(), relation.clone(), to.clone())) {
+            return Err(anyhow!(
+                "memory graph contains duplicate edge {from} -[{relation}]-> {to}"
+            ));
+        }
+        edges.push(GraphEdgeInput {
+            from,
+            relation,
+            to,
+            properties: normalize_graph_properties(&edge.properties, "edge")?,
+        });
+    }
+    Ok(MemoryGraphInput { entities, edges })
 }
 
 fn memory_fts_query(query: &str) -> Option<String> {
@@ -2856,6 +3318,10 @@ mod tests {
         let mut embedding = vec![0.0; MEMORY_EMBEDDING_DIM];
         embedding[axis] = 1.0;
         embedding
+    }
+
+    fn graph(value: serde_json::Value) -> MemoryGraphInput {
+        serde_json::from_value(value).unwrap()
     }
 
     async fn tenant_with_agent(store: &AgentdStore, tenant: &str) {
@@ -3263,6 +3729,230 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn graph_query_walks_one_to_three_hops_and_tracks_memory_lifecycle() {
+        let (_dir, store) = store().await;
+        tenant_with_agent(&store, "one").await;
+        tenant_with_agent(&store, "two").await;
+        let embedding = test_embedding(0);
+        store
+            .put_memory_with_graph(
+                "one",
+                "profile",
+                "ownership",
+                "Alice owns agentd",
+                &embedding,
+                &graph(json!({
+                    "entities":[
+                        {"id":"alice","label":"Alice","type":"person"},
+                        {"id":"agentd","label":"agentd","type":"project"}
+                    ],
+                    "edges":[
+                        {"from":"alice","relation":"owns","to":"agentd"},
+                        {"from":"agentd","relation":"owned_by","to":"alice"}
+                    ]
+                })),
+            )
+            .await
+            .unwrap();
+        store
+            .put_memory_with_graph(
+                "one",
+                "profile",
+                "storage",
+                "agentd uses libSQL",
+                &embedding,
+                &graph(json!({
+                    "entities":[
+                        {"id":"agentd","label":"agentd","type":"project"},
+                        {"id":"libsql","label":"libSQL","type":"database"}
+                    ],
+                    "edges":[{"from":"agentd","relation":"uses","to":"libsql"}]
+                })),
+            )
+            .await
+            .unwrap();
+        store
+            .put_memory_with_graph(
+                "two",
+                "profile",
+                "decoy",
+                "Alice owns a secret",
+                &embedding,
+                &graph(json!({
+                    "entities":[
+                        {"id":"alice","label":"Alice"},
+                        {"id":"secret","label":"Secret"}
+                    ],
+                    "edges":[{"from":"alice","relation":"owns","to":"secret"}]
+                })),
+            )
+            .await
+            .unwrap();
+
+        let outgoing = store
+            .query_graph(
+                "one",
+                "profile",
+                GraphQuery {
+                    entity: "Alice",
+                    relation: None,
+                    direction: "outgoing",
+                    max_hops: 3,
+                    limit: 100,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(outgoing.paths.len(), 2);
+        assert_eq!(outgoing.paths[0].nodes, ["alice", "agentd"]);
+        assert_eq!(outgoing.paths[1].nodes, ["alice", "agentd", "libsql"]);
+        assert!(!outgoing.entities.iter().any(|entity| entity.id == "secret"));
+        assert_eq!(
+            store
+                .query_graph(
+                    "one",
+                    "profile",
+                    GraphQuery {
+                        entity: "alice",
+                        relation: None,
+                        direction: "outgoing",
+                        max_hops: 3,
+                        limit: 1,
+                    },
+                )
+                .await
+                .unwrap()
+                .paths
+                .len(),
+            1
+        );
+
+        let one_hop = store
+            .query_graph(
+                "one",
+                "profile",
+                GraphQuery {
+                    entity: "alice",
+                    relation: None,
+                    direction: "outgoing",
+                    max_hops: 1,
+                    limit: 100,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(one_hop.paths.len(), 1);
+        let relation = store
+            .query_graph(
+                "one",
+                "profile",
+                GraphQuery {
+                    entity: "alice",
+                    relation: Some("owns"),
+                    direction: "outgoing",
+                    max_hops: 3,
+                    limit: 100,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(relation.paths.len(), 1);
+        let incoming = store
+            .query_graph(
+                "one",
+                "profile",
+                GraphQuery {
+                    entity: "libSQL",
+                    relation: None,
+                    direction: "incoming",
+                    max_hops: 3,
+                    limit: 100,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(incoming.paths.len(), 2);
+        assert_eq!(incoming.paths[1].nodes, ["libsql", "agentd", "alice"]);
+
+        store
+            .put_memory(
+                "one",
+                "profile",
+                "storage",
+                "agentd changed storage",
+                &embedding,
+            )
+            .await
+            .unwrap();
+        let after_update = store
+            .query_graph(
+                "one",
+                "profile",
+                GraphQuery {
+                    entity: "alice",
+                    relation: None,
+                    direction: "outgoing",
+                    max_hops: 3,
+                    limit: 100,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(after_update.paths.len(), 1);
+        assert!(!after_update
+            .entities
+            .iter()
+            .any(|entity| entity.id == "libsql"));
+
+        assert!(store
+            .delete_memory("one", "profile", "ownership")
+            .await
+            .unwrap());
+        let after_delete = store
+            .query_graph(
+                "one",
+                "profile",
+                GraphQuery {
+                    entity: "alice",
+                    relation: None,
+                    direction: "outgoing",
+                    max_hops: 3,
+                    limit: 100,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(after_delete.entities.is_empty());
+        assert!(after_delete.paths.is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_graph_does_not_create_memory() {
+        let (_dir, store) = store().await;
+        tenant_with_agent(&store, "one").await;
+        let error = store
+            .put_memory_with_graph(
+                "one",
+                "profile",
+                "invalid",
+                "Alice owns an undeclared entity",
+                &test_embedding(0),
+                &graph(json!({
+                    "entities":[{"id":"alice","label":"Alice"}],
+                    "edges":[{"from":"alice","relation":"owns","to":"missing"}]
+                })),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("must reference entities"));
+        assert!(store
+            .get_memory("one", "profile", "invalid")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn memory_list_pages_are_stable_bounded_and_tenant_scoped() {
         let (_dir, store) = store().await;
         tenant_with_agent(&store, "one").await;
@@ -3439,6 +4129,60 @@ mod tests {
                 "memory_fts_docsize",
                 "memory_fts_idx"
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_version_six_migrates_graph_tables_without_resetting_memory() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("agentd.db");
+        let store = AgentdStore::new(path.to_str().unwrap()).await.unwrap();
+        tenant_with_agent(&store, "one").await;
+        store
+            .put_memory(
+                "one",
+                "profile",
+                "favorite",
+                "likes mangosteen",
+                &test_embedding(0),
+            )
+            .await
+            .unwrap();
+        db::query("DROP TABLE edges")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        db::query("DROP TABLE entities")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        db::query("PRAGMA user_version = 6")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        drop(store);
+
+        let migrated = AgentdStore::new(path.to_str().unwrap()).await.unwrap();
+        assert_eq!(
+            db::query_scalar::<i64>("PRAGMA user_version")
+                .fetch_optional(&migrated.pool)
+                .await
+                .unwrap(),
+            Some(7)
+        );
+        assert!(migrated
+            .get_memory("one", "profile", "favorite")
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            db::query_scalar::<String>(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('entities', 'edges') ORDER BY name",
+            )
+            .fetch_all(&migrated.pool)
+            .await
+            .unwrap(),
+            vec!["edges", "entities"]
         );
     }
 

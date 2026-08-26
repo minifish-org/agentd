@@ -20,8 +20,8 @@ REST turn / due schedule
 
 - The model chooses real tools and the final JSON; host code validates and
   executes.
-- Tenant ownership applies to agents, runs, context, artifacts, memory,
-  schedules, MCP servers, and deliveries.
+- Tenant ownership applies to agents, runs, context, artifacts, memory and its
+  graph projection, schedules, MCP servers, and deliveries.
 - Scope is both the rolling-context key and serialization key. Different
   scopes may run concurrently.
 - Context is a bounded conversation window; memory is explicit durable text
@@ -32,8 +32,9 @@ REST turn / due schedule
 
 ## Persistence
 
-The schema has one version and no upgrade path. Startup accepts an empty
-database or the exact version; otherwise it requests `--reset-data`.
+The schema is versioned. Startup creates v7 for an empty database and performs
+the one supported in-place migration from v6 to v7; unknown versions request
+`--reset-data`.
 
 Important facts are stored once. Runs own activation, final output, and an
 optional requested destination; `run_log` owns model/tool/output/status/error
@@ -42,15 +43,25 @@ only remote delivery state and retry fields. There are no
 activation, receipt, worker, step, side-effect, token, lease, RAG metadata, or
 replay tables.
 
-Memory remains one logical table. Its canonical text and fixed 384-dimension
+Canonical memory remains one logical table. Its text and fixed 384-dimension
 little-endian f32 embedding share the same row; one FTS5 index follows the text
-with triggers. Schema v6 is bound to the pinned multilingual E5 Small model;
-changing that model requires a schema bump and data reset. Search scans vectors
+with triggers. The embedding representation remains bound to the pinned
+multilingual E5 Small model; changing that model requires a schema bump and data
+reset. Search scans vectors
 only inside the selected tenant/namespace and fuses semantic and lexical ranks
 with RRF. A pinned INT8 BGE v2-m3 cross-encoder reranks the RRF top 10 from the
 query and original text, and the API returns at most the top 5. The reranker
-persists no vectors. There are no dynamic RAG tables, vector metadata resources,
-automatic recall, or automatic writes.
+persists no vectors.
+
+Schema v7 adds `entities` and `edges` as a bounded, provenance-preserving graph
+projection of memory. `memory_put` can supply structured entities and relations;
+the host validates them and commits them atomically with the memory and its
+embedding. Updating or deleting a memory replaces or cascades only that memory's
+graph rows. `graph_query` uses ordinary joins and `WITH RECURSIVE`, is isolated
+by tenant and namespace, prevents cycles, and clamps traversal to 1–3 hops and
+100 paths. Graph retrieval and BM25/E5/RRF/BGE retrieval are complementary,
+separately selected tools. There is no automatic entity-extraction model,
+automatic recall, or automatic write.
 
 Enumeration uses bounded keyset pages over one tenant and namespace. The
 optional memory maintainer is an ordinary tenant agent plus an ordinary
@@ -61,7 +72,8 @@ primitive.
 
 ## Deliberate omissions
 
-There is no independent CLI, Controller forwarding layer, compatibility
-parser, migration framework, derived audit database, replay simulator,
-review/approval queue, shell, arbitrary HTTP tool, audio tool, or multi-agent
-orchestration layer. New abstractions require an observed consumer.
+There is no independent CLI, Controller forwarding layer, general compatibility
+parser or migration framework beyond the explicit v6→v7 step, derived audit
+database, replay simulator, review/approval queue, shell, arbitrary HTTP tool,
+audio tool, or multi-agent orchestration layer. New abstractions require an
+observed consumer.

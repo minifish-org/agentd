@@ -81,6 +81,19 @@ and returns a positive normalized relevance `score`; its default and maximum
 limit are 5. Writes are available only to agents through
 `memory_put`/`memory_delete` and fail atomically when embedding fails.
 
+`memory_put` accepts an optional bounded `graph` with `entities` (`id`, `label`,
+optional `type`/`properties`) and directed `edges` (`from`, `relation`, `to`,
+optional `properties`). Every edge must reference entities declared by that
+memory write. The memory text, embedding, entities, and edges commit together.
+Replacing or deleting the memory replaces or removes its graph contribution.
+
+The agent-only `graph_query` tool is in the memory capability family and uses
+the same default namespace rules. It matches an entity ID or exact label, can
+filter one relation, traverses `outgoing`, `incoming`, or `both`, and clamps
+`max_hops` to `1..=3` and results to 100 paths. It is selected independently by
+the model; `memory_search` does not automatically run Graph, and Graph does not
+invoke embedding or reranking.
+
 The agent-only `memory_list` tool enumerates one namespace in ID order. Its
 limit is clamped to `1..=100`; `next_cursor=null` marks completion. Cursors are
 opaque and bound to the current run's tenant and requested namespace. List

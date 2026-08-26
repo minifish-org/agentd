@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 /// The complete host-builtin catalog. Runtime mechanics are deliberately not
 /// tools: every entry below is a real capability the model may exercise.
 pub fn builtin_tool_catalog() -> Vec<ToolSpec> {
-    let mut tools = Vec::with_capacity(16);
+    let mut tools = Vec::with_capacity(17);
 
     add(
         &mut tools,
@@ -77,11 +77,31 @@ pub fn builtin_tool_catalog() -> Vec<ToolSpec> {
         &mut tools,
         ToolFamily::Memory,
         "put",
-        "Create or replace one concise durable fact under a stable id. Store long content as an artifact.",
+        "Create or replace one concise durable fact under a stable id. When the fact contains explicit entities or relationships, include the optional graph structure. Store long content as an artifact.",
         true,
         json!({"type":"object","required":["id","text"],"properties":{
             "id":{"type":"string","minLength":1},"text":{"type":"string","minLength":1},
-            "namespace":{"type":"string"}
+            "namespace":{"type":"string"},
+            "graph":{"type":"object","additionalProperties":false,"description":"Explicit entities and directed relationships stated by this memory. Reuse stable entity IDs across memories.","properties":{
+                "entities":{"type":"array","maxItems":32,"items":{
+                    "type":"object","additionalProperties":false,"required":["id","label"],
+                    "properties":{
+                        "id":{"type":"string","minLength":1,"description":"Stable canonical identifier to reuse for the same entity."},
+                        "label":{"type":"string","minLength":1,"description":"Human-readable entity name."},
+                        "type":{"type":"string","minLength":1,"description":"Optional entity kind, such as person, project, or service."},
+                        "properties":{"type":"object"}
+                    }
+                }},
+                "edges":{"type":"array","maxItems":64,"items":{
+                    "type":"object","additionalProperties":false,"required":["from","relation","to"],
+                    "properties":{
+                        "from":{"type":"string","minLength":1,"description":"Source entity ID declared in this graph."},
+                        "relation":{"type":"string","minLength":1,"description":"Directed relationship name."},
+                        "to":{"type":"string","minLength":1,"description":"Target entity ID declared in this graph."},
+                        "properties":{"type":"object"}
+                    }
+                }}
+            }}
         }}),
     );
     add(
@@ -94,6 +114,20 @@ pub fn builtin_tool_catalog() -> Vec<ToolSpec> {
             "id":{"type":"string","minLength":1},"namespace":{"type":"string"}
         }}),
     );
+    tools.push(ToolSpec {
+        name: "graph_query".into(),
+        family: ToolFamily::Memory,
+        description: "Query explicit entities and relationships derived from durable memory. Use this for dependency, ownership, or other relationship questions that may require 1-3 hops; use memory_search for fuzzy semantic relevance.".into(),
+        input_schema: json!({"type":"object","required":["entity"],"properties":{
+            "entity":{"type":"string","minLength":1,"description":"Exact entity ID or human-readable label to start from."},
+            "namespace":{"type":"string"},
+            "relation":{"type":"string","minLength":1,"description":"Optional exact relationship filter applied at every hop."},
+            "direction":{"type":"string","enum":["outgoing","incoming","both"],"description":"Traversal direction; defaults to both."},
+            "max_hops":{"type":"integer","minimum":1,"maximum":3,"description":"Maximum traversal depth; defaults to 2."},
+            "limit":{"type":"integer","minimum":1,"maximum":100,"description":"Maximum paths to return; defaults to 50."}
+        }}),
+        mutating: false,
+    });
 
     add(
         &mut tools,
@@ -214,9 +248,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalog_contains_only_the_sixteen_real_capabilities() {
+    fn catalog_contains_only_real_capabilities() {
         let tools = builtin_tool_catalog();
-        assert_eq!(tools.len(), 16);
+        assert_eq!(tools.len(), 17);
         assert!(tools
             .iter()
             .all(|tool| ToolFamily::all().contains(&tool.family)));
@@ -224,6 +258,9 @@ mod tests {
             .iter()
             .any(|tool| tool.name == "memory_put" && tool.mutating));
         assert!(visible_tools(&tools, &[]).is_empty());
-        assert_eq!(visible_tools(&tools, &[ToolFamily::Memory]).len(), 5);
+        assert!(tools
+            .iter()
+            .any(|tool| tool.name == "graph_query" && !tool.mutating));
+        assert_eq!(visible_tools(&tools, &[ToolFamily::Memory]).len(), 6);
     }
 }

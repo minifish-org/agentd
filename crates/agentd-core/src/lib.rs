@@ -220,6 +220,7 @@ impl CapabilityEngine {
             "memory_list" => self.execute_memory_list(tenant, params).await,
             "memory_put" => self.execute_memory_put(tenant, params).await,
             "memory_delete" => self.execute_memory_delete(tenant, params).await,
+            "graph_query" => self.execute_graph_query(tenant, params).await,
             "schedule_get" => self.execute_schedule_get(tenant, params).await,
             "schedule_list" => self.execute_schedule_list(tenant, params).await,
             "schedule_put" => self.execute_schedule_put(tenant, params).await,

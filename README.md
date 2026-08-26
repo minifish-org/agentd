@@ -5,9 +5,9 @@ model decides; agentd supplies a native model/tool loop, capability boundaries,
 persistence, scheduling, per-scope serialization, raw traces, and one pull
 delivery outbox.
 
-Database and HTTP compatibility are intentionally not preserved. Runtime data
-is disposable. A schema mismatch is fixed with `--reset-data`, never a
-migration.
+Database and HTTP compatibility are intentionally narrow. Runtime data remains
+disposable, but schema v6 is migrated in place to v7 so existing memory can gain
+the lightweight graph tables. Other schema mismatches require `--reset-data`.
 
 ## Runtime shape
 
@@ -30,11 +30,12 @@ claim run → read context → native model/tool loop
 ```
 
 The database has tenants, agents, runs, run log, contexts, artifacts, memory,
-schedules, deliveries, and MCP servers. Memory is one table with one FTS5
-index and one 384-dimension embedding BLOB per fact. Exact cosine and lexical
-ranks are combined with RRF; its top 10 are reranked to a final top 5. Replay
-is exactly the stored `run_log`; there is no derived replay, audit, inspection,
-simulation, or export control plane.
+lightweight entities and edges, schedules, deliveries, and MCP servers. Memory
+keeps one FTS5 index and one 384-dimension embedding BLOB per fact. Exact cosine
+and lexical ranks are combined with RRF; its top 10 are reranked to a final top
+5. Explicit relationships use ordinary SQL joins and bounded recursive CTEs in
+the same libSQL database. Replay is exactly the stored `run_log`; there is no
+derived replay, audit, inspection, simulation, or export control plane.
 
 ## Start
 
@@ -131,9 +132,9 @@ idempotency key.
 
 ## Tools
 
-There are 16 built-ins: artifact read/write/list; memory get/search/list/put/delete;
-schedule get/list/put/delete; clock now; public-web search/fetch; and pure
-arithmetic. Names are canonical `family_action` names. Mutating tools execute
+There are 17 built-ins: artifact read/write/list; memory get/search/list/put/delete;
+graph query; schedule get/list/put/delete; clock now; public-web search/fetch;
+and pure arithmetic. Names are canonical capability names. Mutating tools execute
 when their family is allowed; there is no generic operator execute endpoint or
 approval workflow. Shell, arbitrary HTTP, audio, run, plan, LLM, output,
 dialog, and context tools do not exist.
@@ -148,6 +149,14 @@ top 10 original texts to BGE in one batch, then returns at most the reranked
 top 5. The reranker stores no vectors or other database state.
 The model decides when to search or write memory, and those actions remain
 ordinary traced tool calls.
+
+`memory_put` may include a bounded `graph` object containing canonical entities
+and directed edges recognized in that fact. The memory row, embedding, entities,
+and edges commit in one transaction; replacing or deleting the memory also
+replaces or removes only its graph contribution. `graph_query` matches an entity
+ID or exact label and walks incoming, outgoing, or both directions for at most
+three hops. It is a separate, read-only, model-selected tool: Graph is not run on
+every semantic search, and no entity extractor or graph database is required.
 
 `memory_list` enumerates one namespace with a host-clamped page size and an
 opaque cursor bound to the current run's tenant and namespace. It returns only

@@ -1,4 +1,5 @@
 use crate::CapabilityEngine;
+use agentd_store::MemoryGraphInput;
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
@@ -147,14 +148,22 @@ impl CapabilityEngine {
             ));
         }
         let embedding = self.embed_passage(text).await?;
+        let graph = params
+            .get("graph")
+            .cloned()
+            .map(serde_json::from_value::<MemoryGraphInput>)
+            .transpose()
+            .map_err(|error| anyhow!("invalid memory graph: {error}"))?
+            .unwrap_or_default();
         let item = self
             .store
-            .put_memory(
+            .put_memory_with_graph(
                 tenant,
                 namespace(params),
                 required(params, "id")?,
                 text,
                 &embedding,
+                &graph,
             )
             .await?;
         Ok(json!({"item":item}))
@@ -220,6 +229,43 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn memory_put_graph_is_queryable_through_the_builtin_tool() {
+        let (_directory, _store, engine) = engine(|_| Ok(embedding())).await;
+        engine
+            .execute_memory_put(
+                "demo",
+                &json!({
+                    "namespace":"profile",
+                    "id":"stack",
+                    "text":"agentd uses libSQL",
+                    "graph":{
+                        "entities":[
+                            {"id":"agentd","label":"agentd","type":"project"},
+                            {"id":"libsql","label":"libSQL","type":"database"}
+                        ],
+                        "edges":[{"from":"agentd","relation":"uses","to":"libsql"}]
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        let result = engine
+            .execute_graph_query(
+                "demo",
+                &json!({
+                    "namespace":"profile",
+                    "entity":"agentd",
+                    "direction":"outgoing",
+                    "max_hops":3
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["graph"]["paths"][0]["hops"], 1);
+        assert_eq!(result["graph"]["paths"][0]["edges"][0]["relation"], "uses");
     }
 
     #[tokio::test]

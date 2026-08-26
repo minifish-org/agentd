@@ -452,7 +452,7 @@ fn inject_runtime_context(tool: &str, mut arguments: Value, agent: &str, scope: 
     let Some(object) = arguments.as_object_mut() else {
         return arguments;
     };
-    if tool.starts_with("memory_") && !object.contains_key("namespace") {
+    if (tool.starts_with("memory_") || tool == "graph_query") && !object.contains_key("namespace") {
         object.insert("namespace".into(), json!(agent));
     }
     if tool.starts_with("schedule_") {
@@ -472,7 +472,10 @@ fn tool_error(error: &str) -> ToolResult {
 
 #[cfg(test)]
 mod tests {
-    use super::{next_context_state, parse_json_object, MemoryMaintenanceScan, RuntimeEngine};
+    use super::{
+        inject_runtime_context, next_context_state, parse_json_object, MemoryMaintenanceScan,
+        RuntimeEngine,
+    };
     use crate::{CapabilityEngine, CapabilityEngineConfig, ToolResult};
     use agentd_api::{AgentLimits, AgentResource, AgentSpec, ResourceMeta, ToolFamily};
     use agentd_store::{AgentdStore, NewRun};
@@ -510,6 +513,19 @@ mod tests {
         );
         assert!(parse_json_object("\"plain string\"").is_none());
         assert!(parse_json_object("[1,2,3]").is_none());
+    }
+
+    #[test]
+    fn graph_query_inherits_the_agent_memory_namespace() {
+        assert_eq!(
+            inject_runtime_context(
+                "graph_query",
+                json!({"entity":"agentd"}),
+                "assistant",
+                "chat"
+            ),
+            json!({"entity":"agentd","namespace":"assistant"})
+        );
     }
 
     #[test]

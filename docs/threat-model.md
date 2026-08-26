@@ -91,6 +91,13 @@ The reserved maintainer is pinned to `standard/chat`; its native loop binds
 memory calls to the run's input namespace, blocks mutations until enumeration is
 complete, and rejects a final response if any `memory_list` page remains unread.
 
+Graph rows inherit the memory's tenant, namespace, and source memory ID.
+`memory_put` bounds entity/edge counts and property sizes, rejects undeclared
+edge endpoints, and commits graph rows in the same transaction as memory.
+`graph_query` is read-only, cycle-safe, limited to three hops and 100 paths, and
+does not broaden the caller's namespace. Entity labels, relations, properties,
+and graph results remain untrusted model-visible data.
+
 ### MCP servers
 
 MCP configuration is operator-controlled. Secret values are referenced by
