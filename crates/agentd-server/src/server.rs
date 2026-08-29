@@ -328,6 +328,17 @@ mod tests {
             .0,
             StatusCode::OK
         );
+        let (_, waited) = request(
+            &app,
+            Method::GET,
+            &format!("/v1/tenants/demo/runs/{run_id}/wait?timeout_ms=1"),
+            None,
+        )
+        .await;
+        assert_eq!(waited["status"], "cancelled");
+        assert_eq!(waited["timed_out"], false);
+        assert_eq!(waited["output"], Value::Null);
+        assert_eq!(waited["error"], "test");
         let (_, trace) = request(
             &app,
             Method::GET,

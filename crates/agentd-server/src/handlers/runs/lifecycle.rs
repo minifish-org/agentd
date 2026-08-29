@@ -62,12 +62,14 @@ pub(crate) async fn wait_run(
                     run.status,
                     AgentRunStatus::Succeeded | AgentRunStatus::Failed | AgentRunStatus::Cancelled
                 ) {
+                    let error = run.error.clone();
                     return json_result(state.store.get_run_output(run_id).await.map(|output| {
                         serde_json::json!({
                             "run_id": run_id,
                             "status": status,
                             "timed_out": false,
                             "output": output,
+                            "error": error,
                         })
                     }));
                 }

@@ -33,7 +33,9 @@ Turn input:
 Turn submission is always asynchronous and returns HTTP `202` with
 `{"run_id":"...","status":"queued"}`. Read the result from
 `GET .../runs/:id/wait?timeout_ms=30000`; every successful run remains
-pullable. `delivery` is optional and must be explicit—scope is never a delivery
+pullable. Terminal wait responses include `error` when a run fails or is
+cancelled, so adapters can surface the failure instead of silently dropping a
+turn. `delivery` is optional and must be explicit—scope is never a delivery
 destination. The trace endpoint returns stored `run_log` rows in insertion
 order.
 

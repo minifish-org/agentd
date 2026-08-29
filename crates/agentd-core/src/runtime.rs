@@ -1,6 +1,6 @@
 use crate::llm_provider::extract_openai_message_content;
 use crate::{CapabilityEngine, ToolResult};
-use agentd_api::ToolSpec;
+use agentd_api::{ToolFamily, ToolSpec};
 use agentd_store::{AgentdStore, AssignedRun};
 use anyhow::{anyhow, Result};
 use chrono::Utc;
@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 
 const DEFAULT_CONTEXT_TURNS: usize = 20;
+const MAX_WEB_TOOL_CALLS_PER_RUN: usize = 6;
 const MEMORY_MAINTAINER_AGENT: &str = "system/memory-maintainer";
 
 const NATIVE_LOOP_PROMPT: &str = r#"Native tool rules:
@@ -29,6 +30,34 @@ pub struct RuntimeEngine {
 #[derive(Debug, Clone)]
 pub struct ExecutionReport {
     pub error: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct ToolBudget {
+    web_calls: usize,
+}
+
+impl ToolBudget {
+    fn native_tools(&self, callable: &[ToolSpec]) -> Vec<Value> {
+        callable
+            .iter()
+            .filter(|tool| {
+                tool.family != ToolFamily::Web || self.web_calls < MAX_WEB_TOOL_CALLS_PER_RUN
+            })
+            .map(native_function_tool)
+            .collect()
+    }
+
+    fn admit(&mut self, tool: &ToolSpec) -> bool {
+        if tool.family != ToolFamily::Web {
+            return true;
+        }
+        if self.web_calls >= MAX_WEB_TOOL_CALLS_PER_RUN {
+            return false;
+        }
+        self.web_calls += 1;
+        true
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,8 +231,9 @@ impl RuntimeEngine {
             .cloned()
             .map(|tool| (tool.name.clone(), tool))
             .collect();
-        let tools: Vec<Value> = callable.iter().map(native_function_tool).collect();
+        let mut tool_budget = ToolBudget::default();
         for step in 1..=assigned.max_steps.max(1) {
+            let tools = tool_budget.native_tools(&callable);
             let mut request = json!({
                 "messages": messages,
                 "temperature": assigned.agent_temperature.unwrap_or(0.2),
@@ -304,6 +334,9 @@ impl RuntimeEngine {
                     .await?;
 
                 let envelope = match by_name.get(&name) {
+                    Some(tool) if !tool_budget.admit(tool) => tool_error(
+                        "web tool call budget exceeded; answer using results already collected",
+                    ),
                     Some(tool) => self.caps.execute_tool(&run.tenant, tool, &arguments).await,
                     None => tool_error("tool is not visible to this agent"),
                 };
@@ -474,14 +507,41 @@ fn tool_error(error: &str) -> ToolResult {
 mod tests {
     use super::{
         inject_runtime_context, next_context_state, parse_json_object, MemoryMaintenanceScan,
-        RuntimeEngine,
+        RuntimeEngine, ToolBudget, MAX_WEB_TOOL_CALLS_PER_RUN,
     };
     use crate::{CapabilityEngine, CapabilityEngineConfig, ToolResult};
-    use agentd_api::{AgentLimits, AgentResource, AgentSpec, ResourceMeta, ToolFamily};
+    use agentd_api::{AgentLimits, AgentResource, AgentSpec, ResourceMeta, ToolFamily, ToolSpec};
     use agentd_store::{AgentdStore, NewRun};
     use axum::{routing::post, Json, Router};
     use serde_json::json;
     use std::collections::BTreeMap;
+
+    fn test_tool(name: &str, family: ToolFamily) -> ToolSpec {
+        ToolSpec {
+            name: name.into(),
+            family,
+            description: String::new(),
+            input_schema: json!({"type":"object"}),
+            mutating: false,
+        }
+    }
+
+    #[test]
+    fn web_tool_budget_hides_web_tools_after_the_limit() {
+        let web = test_tool("web_search", ToolFamily::Web);
+        let calc = test_tool("calc_eval", ToolFamily::Calc);
+        let callable = vec![web.clone(), calc];
+        let mut budget = ToolBudget::default();
+
+        for _ in 0..MAX_WEB_TOOL_CALLS_PER_RUN {
+            assert!(budget.admit(&web));
+        }
+        assert!(!budget.admit(&web));
+
+        let tools = budget.native_tools(&callable);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["function"]["name"], "calc_eval");
+    }
 
     #[test]
     fn context_window_counts_complete_turns_and_zero_disables_it() {
