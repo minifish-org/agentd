@@ -23,8 +23,9 @@ pub struct DeliveryOutboxRecord {
     pub run_id: Uuid,
     pub status: String,
     pub destination: String,
-    /// The canonical run output, joined at read time rather than copied into
-    /// the delivery row.
+    /// Immutable payload captured when the terminal run state creates the
+    /// delivery. Successful runs carry their canonical output; failed runs
+    /// carry a transport-neutral user-facing failure message.
     #[serde(default)]
     pub payload: serde_json::Value,
     pub attempt: u32,

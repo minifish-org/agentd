@@ -11,6 +11,8 @@ not preserved unless a release note explicitly says otherwise.
 - Stable, bounded `memory_list` pagination with tenant/namespace-bound cursors.
 - An explicit per-tenant memory-maintenance preset whose schedule is disabled
   by default and whose agent can access only the memory tool family.
+- Failure deliveries for explicitly addressed runs, including a stable
+  machine-readable timeout/failure code and a retry-safe user-facing reply.
 
 ### Changed
 
@@ -21,6 +23,13 @@ not preserved unless a release note explicitly says otherwise.
 - Memory-maintenance agents now use `standard/chat`; the native loop requires
   them to complete tenant-bound `memory_list` pagination before reporting
   success or modifying memory.
+- Native model requests now enable JSON object mode, and final output
+  normalization repairs malformed multiline or serialized delivery objects
+  before they can enter rolling context or reach a transport.
+- Delivery rows now capture an immutable payload at terminal commit time;
+  schema versions 6 and 7 migrate in place to schema version 8.
+- The example `simple-bot` keeps ten complete context turns and allows 180
+  seconds for tool-heavy runs.
 
 ## [0.1.0-alpha.1] - 2026-08-15
 

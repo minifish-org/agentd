@@ -1,6 +1,7 @@
 # PUT this document to /v1/tenants/demo/agents/simple-bot.
 # No persona: the native agent loop uses the host's default system prompt.
 model = "standard/chat"
-timeout_ms = 90000
+timeout_ms = 180000
 max_steps = 8
 max_tokens = 4096
+context_window = 10

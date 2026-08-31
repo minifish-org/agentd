@@ -207,7 +207,7 @@ impl RuntimeEngine {
             .await?
             .map(|context| context.state)
             .unwrap_or_else(|| json!({}));
-        let prior_messages = context_messages(&prior_state);
+        let prior_messages = context_messages(&prior_state, assigned.agent_context_turns);
         let user_content = json!({
             "input": run.input,
             "source": run.source,
@@ -239,6 +239,7 @@ impl RuntimeEngine {
                 "temperature": assigned.agent_temperature.unwrap_or(0.2),
                 "max_tokens": assigned.agent_max_tokens.unwrap_or(4096),
                 "parallel_tool_calls": false,
+                "response_format": {"type":"json_object"},
             });
             if !tools.is_empty() {
                 request["tools"] = Value::Array(tools.clone());
@@ -282,8 +283,7 @@ impl RuntimeEngine {
                 if content.trim().is_empty() {
                     return Err(anyhow!("model returned empty final content"));
                 }
-                let output =
-                    parse_json_object(&content).unwrap_or_else(|| json!({"reply":content}));
+                let output = normalize_final_output(&content);
                 let context = next_context_state(
                     assigned.agent_context_turns,
                     prior_messages,
@@ -377,6 +377,127 @@ fn parse_json_object(raw: &str) -> Option<Value> {
         .or_else(|| first_balanced_object(strip_code_fence(raw.trim())).and_then(decode_object))
 }
 
+fn normalize_final_output(raw: &str) -> Value {
+    let mut output = parse_json_object(raw).or_else(|| parse_repaired_json_object(raw));
+    for _ in 0..3 {
+        let Some(current) = output.as_ref() else {
+            break;
+        };
+        let Some(object) = current.as_object() else {
+            break;
+        };
+        if object.len() != 1 {
+            break;
+        }
+        let Some(serialized) = object.get("reply").and_then(Value::as_str) else {
+            break;
+        };
+        let Some(nested) = parse_json_object(serialized)
+            .or_else(|| parse_repaired_json_object(serialized))
+            .filter(is_delivery_object)
+        else {
+            break;
+        };
+        output = Some(nested);
+    }
+    output.unwrap_or_else(|| {
+        let reply = extract_malformed_reply(raw).unwrap_or_else(|| raw.to_string());
+        json!({"reply":reply})
+    })
+}
+
+fn parse_repaired_json_object(raw: &str) -> Option<Value> {
+    let trimmed = strip_code_fence(raw.trim()).trim();
+    let candidate = first_balanced_object(trimmed).unwrap_or(trimmed);
+    let candidate = candidate
+        .strip_prefix("{\"{")
+        .map(|rest| format!("{{{rest}"))
+        .unwrap_or_else(|| candidate.to_string());
+    decode_object(&escape_json_string_controls(&candidate))
+}
+
+fn escape_json_string_controls(raw: &str) -> String {
+    let mut repaired = String::with_capacity(raw.len());
+    let mut quoted = false;
+    let mut escaped = false;
+    for ch in raw.chars() {
+        if quoted && !escaped {
+            match ch {
+                '\n' => {
+                    repaired.push_str("\\n");
+                    continue;
+                }
+                '\r' => {
+                    repaired.push_str("\\r");
+                    continue;
+                }
+                '\t' => {
+                    repaired.push_str("\\t");
+                    continue;
+                }
+                ch if ch < ' ' => {
+                    use std::fmt::Write as _;
+                    let _ = write!(repaired, "\\u{:04x}", ch as u32);
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        repaired.push(ch);
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' && quoted {
+            escaped = true;
+        } else if ch == '"' {
+            quoted = !quoted;
+        }
+    }
+    repaired
+}
+
+fn extract_malformed_reply(raw: &str) -> Option<String> {
+    let candidate = strip_code_fence(raw.trim()).trim();
+    let reply = candidate.find("\"reply\"")?;
+    let value = candidate[reply + "\"reply\"".len()..]
+        .trim_start()
+        .strip_prefix(':')?
+        .trim_start();
+    if !value.starts_with('"') {
+        return None;
+    }
+    let mut escaped = false;
+    for (offset, ch) in value.char_indices().skip(1) {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch != '"' {
+            continue;
+        }
+        let suffix = value[offset + ch.len_utf8()..].trim_start();
+        if !suffix.starts_with('}') && !suffix.starts_with(',') {
+            continue;
+        }
+        let encoded = escape_json_string_controls(&value[..=offset]);
+        if let Ok(reply) = serde_json::from_str::<String>(&encoded) {
+            return Some(reply);
+        }
+    }
+    None
+}
+
+fn is_delivery_object(value: &Value) -> bool {
+    value.as_object().is_some_and(|object| {
+        ["reply", "attachments", "location", "voice_reply"]
+            .iter()
+            .any(|field| object.contains_key(*field))
+    })
+}
+
 fn decode_object(raw: &str) -> Option<Value> {
     serde_json::from_str(raw).ok().filter(Value::is_object)
 }
@@ -437,12 +558,22 @@ fn native_function_tool(tool: &ToolSpec) -> Value {
     })
 }
 
-fn context_messages(state: &Value) -> Vec<Value> {
-    state
+fn context_messages(state: &Value, configured_turns: Option<usize>) -> Vec<Value> {
+    let mut messages = state
         .get("messages")
         .and_then(Value::as_array)
         .cloned()
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let keep = configured_turns
+        .unwrap_or(DEFAULT_CONTEXT_TURNS)
+        .saturating_mul(2);
+    if keep == 0 {
+        return Vec::new();
+    }
+    if messages.len() > keep {
+        messages.drain(0..messages.len() - keep);
+    }
+    messages
 }
 
 fn model_message(message: &Value) -> Option<Value> {
@@ -506,8 +637,9 @@ fn tool_error(error: &str) -> ToolResult {
 #[cfg(test)]
 mod tests {
     use super::{
-        inject_runtime_context, next_context_state, parse_json_object, MemoryMaintenanceScan,
-        RuntimeEngine, ToolBudget, MAX_WEB_TOOL_CALLS_PER_RUN,
+        context_messages, inject_runtime_context, next_context_state, normalize_final_output,
+        parse_json_object, MemoryMaintenanceScan, RuntimeEngine, ToolBudget,
+        MAX_WEB_TOOL_CALLS_PER_RUN,
     };
     use crate::{CapabilityEngine, CapabilityEngineConfig, ToolResult};
     use agentd_api::{AgentLimits, AgentResource, AgentSpec, ResourceMeta, ToolFamily, ToolSpec};
@@ -559,6 +691,17 @@ mod tests {
         let messages = state["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["content"], "new");
+
+        let existing = json!({"messages":[
+            {"role":"user", "content":"old one"},
+            {"role":"assistant", "content":"old reply"},
+            {"role":"user", "content":"latest"},
+            {"role":"assistant", "content":"latest reply"}
+        ]});
+        assert!(context_messages(&existing, Some(0)).is_empty());
+        let bounded = context_messages(&existing, Some(1));
+        assert_eq!(bounded.len(), 2);
+        assert_eq!(bounded[0]["content"], "latest");
     }
 
     #[test]
@@ -573,6 +716,34 @@ mod tests {
         );
         assert!(parse_json_object("\"plain string\"").is_none());
         assert!(parse_json_object("[1,2,3]").is_none());
+    }
+
+    #[test]
+    fn final_output_normalizer_repairs_observed_malformed_replies() {
+        assert_eq!(
+            normalize_final_output("{\"reply\":\"first line\nsecond line\"}"),
+            json!({"reply":"first line\nsecond line"})
+        );
+        assert_eq!(
+            normalize_final_output("{\"{\"reply\":\"first line\nsecond line\"}"),
+            json!({"reply":"first line\nsecond line"})
+        );
+    }
+
+    #[test]
+    fn final_output_normalizer_unwraps_serialized_delivery_objects_only() {
+        assert_eq!(
+            normalize_final_output(r#"{"reply":"{\"reply\":\"ok\"}"}"#),
+            json!({"reply":"ok"})
+        );
+        assert_eq!(
+            normalize_final_output(r#"{"reply":"{\"custom\":true}"}"#),
+            json!({"reply":"{\"custom\":true}"})
+        );
+        assert_eq!(
+            normalize_final_output("plain text"),
+            json!({"reply":"plain text"})
+        );
     }
 
     #[test]

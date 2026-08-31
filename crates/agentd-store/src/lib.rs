@@ -1420,13 +1420,18 @@ impl AgentdStore {
     }
 
     async fn initialize_schema(&self) -> Result<()> {
-        const SCHEMA_VERSION: i64 = 7;
-        const MIGRATABLE_SCHEMA_VERSION: i64 = 6;
+        const SCHEMA_VERSION: i64 = 8;
+        const GRAPH_MIGRATION_SCHEMA_VERSION: i64 = 6;
+        const DELIVERY_PAYLOAD_SCHEMA_VERSION: i64 = 7;
         let version = db::query_scalar::<i64>("PRAGMA user_version")
             .fetch_optional(&self.pool)
             .await?
             .unwrap_or(0);
-        if version != 0 && version != MIGRATABLE_SCHEMA_VERSION && version != SCHEMA_VERSION {
+        if version != 0
+            && version != GRAPH_MIGRATION_SCHEMA_VERSION
+            && version != DELIVERY_PAYLOAD_SCHEMA_VERSION
+            && version != SCHEMA_VERSION
+        {
             return Err(anyhow!(
                 "agentd schema version {version} is unsupported; restart with --reset-data"
             ));
@@ -1545,6 +1550,7 @@ impl AgentdStore {
                 run_id TEXT NOT NULL,
                 status TEXT NOT NULL,
                 destination TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
                 idempotency_key TEXT NOT NULL UNIQUE,
                 attempt INTEGER NOT NULL DEFAULT 0,
                 next_attempt_at TEXT,
@@ -1613,15 +1619,31 @@ impl AgentdStore {
             for statement in statements.into_iter().chain(graph_statements) {
                 db::query(statement).execute(&self.pool).await?;
             }
-            db::query("PRAGMA user_version = 7")
+            db::query("PRAGMA user_version = 8")
                 .execute(&self.pool)
                 .await?;
-        } else if version == MIGRATABLE_SCHEMA_VERSION {
+        } else if matches!(
+            version,
+            GRAPH_MIGRATION_SCHEMA_VERSION | DELIVERY_PAYLOAD_SCHEMA_VERSION
+        ) {
             let mut tx = self.pool.begin().await?;
-            for statement in graph_statements {
-                db::query(statement).execute(&mut tx).await?;
+            if version == GRAPH_MIGRATION_SCHEMA_VERSION {
+                for statement in graph_statements {
+                    db::query(statement).execute(&mut tx).await?;
+                }
             }
-            db::query("PRAGMA user_version = 7")
+            db::query(
+                "ALTER TABLE deliveries ADD COLUMN payload_json TEXT NOT NULL DEFAULT 'null'",
+            )
+            .execute(&mut tx)
+            .await?;
+            db::query(
+                "UPDATE deliveries SET payload_json = COALESCE(\
+                 (SELECT output_json FROM runs WHERE runs.run_id = deliveries.run_id), 'null')",
+            )
+            .execute(&mut tx)
+            .await?;
+            db::query("PRAGMA user_version = 8")
                 .execute(&mut tx)
                 .await?;
             tx.commit().await?;
@@ -1976,9 +1998,9 @@ impl AgentdStore {
     ) -> Result<Vec<DeliveryOutboxRecord>> {
         let mut sql = String::from(
             "SELECT d.delivery_id, d.tenant, d.run_id, d.status, d.destination, \
-             r.output_json AS payload_json, d.attempt, d.next_attempt_at, d.last_error, \
+             d.payload_json, d.attempt, d.next_attempt_at, d.last_error, \
              d.claim_token, d.claim_expires_at, d.created_at, d.updated_at \
-             FROM deliveries d JOIN runs r ON r.run_id = d.run_id WHERE 1 = 1",
+             FROM deliveries d WHERE 1 = 1",
         );
         if tenant.is_some() {
             sql.push_str(" AND d.tenant = ?");
@@ -2013,9 +2035,9 @@ impl AgentdStore {
     ) -> Result<Option<DeliveryOutboxRecord>> {
         let row = db::query(
             "SELECT d.delivery_id, d.tenant, d.run_id, d.status, d.destination, \
-             r.output_json AS payload_json, d.attempt, d.next_attempt_at, d.last_error, \
+             d.payload_json, d.attempt, d.next_attempt_at, d.last_error, \
              d.claim_token, d.claim_expires_at, d.created_at, d.updated_at \
-             FROM deliveries d JOIN runs r ON r.run_id = d.run_id WHERE d.delivery_id = ?",
+             FROM deliveries d WHERE d.delivery_id = ?",
         )
         .bind(delivery_id.to_string())
         .fetch_optional(&self.pool)
@@ -2032,9 +2054,9 @@ impl AgentdStore {
     ) -> Result<Vec<DeliveryOutboxRecord>> {
         let rows = db::query(
             "SELECT d.delivery_id, d.tenant, d.run_id, d.status, d.destination, \
-             r.output_json AS payload_json, d.attempt, d.next_attempt_at, d.last_error, \
+             d.payload_json, d.attempt, d.next_attempt_at, d.last_error, \
              d.claim_token, d.claim_expires_at, d.created_at, d.updated_at \
-             FROM deliveries d JOIN runs r ON r.run_id = d.run_id WHERE d.tenant = ? AND ( \
+             FROM deliveries d WHERE d.tenant = ? AND ( \
                (d.status = 'pending' AND (d.next_attempt_at IS NULL OR d.next_attempt_at <= ?)) OR \
                (d.status = 'claimed' AND (d.claim_expires_at IS NULL OR d.claim_expires_at <= ?)) \
              ) ORDER BY d.created_at LIMIT ?",
@@ -2452,14 +2474,15 @@ impl AgentdStore {
             db::query(
                 r#"INSERT INTO deliveries (
                        delivery_id, tenant, run_id, status, destination,
-                       idempotency_key, attempt, created_at, updated_at
-                   ) VALUES (?, ?, ?, 'pending', ?, ?, 0, ?, ?)
+                       payload_json, idempotency_key, attempt, created_at, updated_at
+                   ) VALUES (?, ?, ?, 'pending', ?, ?, ?, 0, ?, ?)
                    ON CONFLICT(idempotency_key) DO NOTHING"#,
             )
             .bind(Uuid::new_v4().to_string())
             .bind(&tenant)
             .bind(run_id.to_string())
             .bind(destination)
+            .bind(&output_json)
             .bind(format!("run:{run_id}:output"))
             .bind(&now)
             .bind(&now)
@@ -2471,9 +2494,14 @@ impl AgentdStore {
     }
 
     /// Atomically persist a terminal failure. Partial model/tool trace remains
-    /// intact and no context or delivery is created.
+    /// intact, context is unchanged, and an explicit destination receives one
+    /// transport-neutral failure payload.
     pub async fn fail_run(&self, run_id: Uuid, error: &str) -> Result<()> {
         let mut tx = self.pool.begin().await?;
+        let row = db::query("SELECT tenant, delivery_destination FROM runs WHERE run_id = ?")
+            .bind(run_id.to_string())
+            .fetch_optional(&mut tx)
+            .await?;
         let now = Utc::now().to_rfc3339();
         let changed = db::query(
             "UPDATE runs SET status = 'failed', error = ?, updated_at = ? \
@@ -2494,6 +2522,30 @@ impl AgentdStore {
             .bind(&now)
             .execute(&mut tx)
             .await?;
+            if let Some(row) = row {
+                let tenant = row.try_get::<String, _>("tenant")?;
+                let destination = row.try_get::<Option<String>, _>("delivery_destination")?;
+                if let Some(destination) = destination {
+                    let payload = failure_delivery_payload(error).to_string();
+                    db::query(
+                        r#"INSERT INTO deliveries (
+                               delivery_id, tenant, run_id, status, destination,
+                               payload_json, idempotency_key, attempt, created_at, updated_at
+                           ) VALUES (?, ?, ?, 'pending', ?, ?, ?, 0, ?, ?)
+                           ON CONFLICT(idempotency_key) DO NOTHING"#,
+                    )
+                    .bind(Uuid::new_v4().to_string())
+                    .bind(tenant)
+                    .bind(run_id.to_string())
+                    .bind(destination)
+                    .bind(payload)
+                    .bind(format!("run:{run_id}:failure"))
+                    .bind(&now)
+                    .bind(&now)
+                    .execute(&mut tx)
+                    .await?;
+                }
+            }
         }
         tx.commit().await?;
         Ok(())
@@ -3275,6 +3327,20 @@ fn row_to_delivery_outbox(row: db::SqlRow) -> Result<DeliveryOutboxRecord> {
     })
 }
 
+fn failure_delivery_payload(error: &str) -> serde_json::Value {
+    if error == "run timeout exceeded" {
+        serde_json::json!({
+            "reply":"Sorry, this request took too long to complete. Please try again.",
+            "error":{"code":"run_timeout"}
+        })
+    } else {
+        serde_json::json!({
+            "reply":"Sorry, this request could not be completed. Please try again.",
+            "error":{"code":"run_failed"}
+        })
+    }
+}
+
 fn parse_ts_field(row: &db::SqlRow, name: &str) -> Result<DateTime<Utc>> {
     Ok(DateTime::parse_from_rfc3339(&row.try_get::<String, _>(name)?)?.with_timezone(&Utc))
 }
@@ -3503,6 +3569,35 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_run_enqueues_one_immutable_failure_delivery() {
+        let (_dir, store) = store().await;
+        tenant_with_agent(&store, "demo").await;
+        let run_id = submit_with_delivery(&store, "demo", "chat:42", None, Some("tg:42")).await;
+        store.claim_next_run().await.unwrap().unwrap();
+
+        store
+            .fail_run(run_id, "run timeout exceeded")
+            .await
+            .unwrap();
+        store.fail_run(run_id, "duplicate failure").await.unwrap();
+
+        let run = store.get_run(run_id).await.unwrap().unwrap();
+        assert_eq!(run.status, AgentRunStatus::Failed);
+        assert_eq!(run.output, None);
+        let deliveries = store
+            .list_delivery_outbox(Some("demo"), None, Some(run_id), 10)
+            .await
+            .unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].status, "pending");
+        assert_eq!(deliveries[0].destination, "tg:42");
+        assert_eq!(deliveries[0].payload["error"]["code"], "run_timeout");
+        assert!(deliveries[0].payload["reply"]
+            .as_str()
+            .is_some_and(|reply| reply.contains("too long")));
     }
 
     #[tokio::test]
@@ -4156,6 +4251,10 @@ mod tests {
             .execute(&store.pool)
             .await
             .unwrap();
+        db::query("ALTER TABLE deliveries DROP COLUMN payload_json")
+            .execute(&store.pool)
+            .await
+            .unwrap();
         db::query("PRAGMA user_version = 6")
             .execute(&store.pool)
             .await
@@ -4168,7 +4267,7 @@ mod tests {
                 .fetch_optional(&migrated.pool)
                 .await
                 .unwrap(),
-            Some(7)
+            Some(8)
         );
         assert!(migrated
             .get_memory("one", "profile", "favorite")
@@ -4183,6 +4282,44 @@ mod tests {
             .await
             .unwrap(),
             vec!["edges", "entities"]
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_version_seven_backfills_immutable_delivery_payloads() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("agentd.db");
+        let store = AgentdStore::new(path.to_str().unwrap()).await.unwrap();
+        tenant_with_agent(&store, "demo").await;
+        let run_id = submit_with_delivery(&store, "demo", "chat:42", None, Some("tg:42")).await;
+        store.claim_next_run().await.unwrap().unwrap();
+        store
+            .finalize_run_success(run_id, &json!({"reply":"preserved"}), None)
+            .await
+            .unwrap();
+        db::query("ALTER TABLE deliveries DROP COLUMN payload_json")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        db::query("PRAGMA user_version = 7")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        drop(store);
+
+        let migrated = AgentdStore::new(path.to_str().unwrap()).await.unwrap();
+        let deliveries = migrated
+            .list_delivery_outbox(Some("demo"), None, Some(run_id), 10)
+            .await
+            .unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].payload, json!({"reply":"preserved"}));
+        assert_eq!(
+            db::query_scalar::<i64>("PRAGMA user_version")
+                .fetch_optional(&migrated.pool)
+                .await
+                .unwrap(),
+            Some(8)
         );
     }
 
