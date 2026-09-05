@@ -13,3 +13,7 @@ api_token = "local-dev-token"
 llm_api_base = "http://host.docker.internal:8000/v1"
 llm_api_key = ""
 llm_model = "local/chat"
+
+# sandbox_session is intentionally disabled in the generic Docker example:
+# Docker Desktop may not expose /dev/kvm. Use agentd.kvm.toml.example on a
+# KVM-capable Linux host and pin the guest image by digest.

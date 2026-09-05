@@ -41,3 +41,28 @@ jobs:
           cache-to: |
             type=gha,mode=max
             type=registry,ref=ghcr.io/${{ github.repository }}:buildcache,mode=max
+      - uses: docker/metadata-action@v6
+        id: sandbox-meta
+        with:
+          images: ghcr.io/${{ github.repository }}-sandbox
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=tag
+            type=sha,prefix=sha-
+      - uses: docker/build-push-action@v7
+        id: sandbox-image
+        with:
+          context: .
+          file: ./Dockerfile.sandbox
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.sandbox-meta.outputs.tags }}
+          labels: ${{ steps.sandbox-meta.outputs.labels }}
+          cache-from: |
+            type=gha,scope=sandbox
+            type=registry,ref=ghcr.io/${{ github.repository }}-sandbox:buildcache
+          cache-to: |
+            type=gha,mode=max,scope=sandbox
+            type=registry,ref=ghcr.io/${{ github.repository }}-sandbox:buildcache,mode=max
+      - name: Record sandbox digest
+        run: echo 'Sandbox image digest `${{ steps.sandbox-image.outputs.digest }}`' >> "$GITHUB_STEP_SUMMARY"

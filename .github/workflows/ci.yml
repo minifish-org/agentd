@@ -19,8 +19,14 @@ jobs:
     timeout-minutes: 30
     env:
       CARGO_INCREMENTAL: "0"
+      # microsandbox uses SQLx/SQLite while agentd uses libSQL's bundled SQLite.
+      # Link SQLx to the system library so the final Linux binaries contain only
+      # one statically bundled SQLite implementation.
+      LIBSQLITE3_SYS_USE_PKG_CONFIG: "1"
     steps:
       - uses: actions/checkout@v7
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libcap-ng-dev libsqlite3-dev pkg-config
       - uses: actions/cache@v6
         with:
           path: |

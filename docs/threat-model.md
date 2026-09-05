@@ -68,9 +68,9 @@ approval step.
 
 ### Built-in tools
 
-Built-ins operate on tenant-scoped database resources, bounded public-text web
-fetches, time, and arithmetic. There is no built-in shell, arbitrary HTTP
-request, host filesystem handle, or hidden host write.
+Baseline built-ins operate on tenant-scoped database resources, bounded
+public-text web fetches, time, and arithmetic. There is no host shell, host
+filesystem handle, or hidden host write.
 
 `web_fetch` accepts only HTTP(S), rejects loopback/private/link-local and other
 non-public resolved addresses, validates every redirect, disables automatic
@@ -97,6 +97,27 @@ edge endpoints, and commits graph rows in the same transaction as memory.
 `graph_query` is read-only, cycle-safe, limited to three hops and 100 paths, and
 does not broaden the caller's namespace. Entity labels, relations, properties,
 and graph results remain untrusted model-visible data.
+
+### Sandbox sessions
+
+`sandbox_session` is absent unless the operator enables microsandbox globally,
+and agents must explicitly include `sandbox` in `allowed_families`. Each run
+gets at most one hardware-isolated microVM with fixed operator-selected CPU,
+memory, image, command timeout, and output limits. The model cannot choose a
+host mount, image, VM size, session identifier, or lifetime.
+
+The guest has microsandbox's default network access and can therefore contact
+addresses reachable from the host network; agentd does not add a domain
+allowlist. Do not inject host credentials into guest commands. The integration
+does not mount the agentd database, configuration, artifacts, or host working
+tree. Command arguments and bounded command output are still stored in the raw
+run trace and must be treated as sensitive.
+
+On Linux, the outer agentd container receives only `/dev/kvm` and remains a
+non-root process without blanket `--privileged` access. A guest compromise is
+contained by the microVM boundary, but hypervisor vulnerabilities, network
+side effects, denial of service within configured limits, and sensitive data
+explicitly supplied to a command remain residual risks.
 
 ### MCP servers
 

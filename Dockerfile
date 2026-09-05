@@ -13,7 +13,11 @@ RUN /usr/local/bin/fetch-embedding-model \
     /models/bge-reranker-v2-m3 \
     /usr/local/share/agentd/bge-reranker-v2-m3.LICENSE
 
-FROM rust:1.92-trixie AS builder
+FROM rust:1.94-trixie AS builder
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libcap-ng-dev libsqlite3-dev pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+ENV LIBSQLITE3_SYS_USE_PKG_CONFIG=1
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY .cargo ./.cargo
@@ -27,10 +31,10 @@ FROM debian:trixie-slim
 LABEL org.opencontainers.image.source="https://github.com/minifish-org/agentd"
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && apt-get install -y --no-install-recommends ca-certificates curl libcap-ng0 libsqlite3-0 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --home-dir /var/lib/agentd agentd \
-    && mkdir -p /etc/agentd /var/lib/agentd /opt/agentd/models \
+    && mkdir -p /etc/agentd /var/lib/agentd/microsandbox /opt/agentd/models \
     && chown -R agentd:agentd /var/lib/agentd
 COPY --from=builder /tmp/agentd /usr/local/bin/agentd
 COPY --from=retrieval-models /models/multilingual-e5-small /opt/agentd/models/multilingual-e5-small

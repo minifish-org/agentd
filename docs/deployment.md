@@ -51,6 +51,48 @@ generic configuration with a development-only token and no personal service
 addresses. Keep the published port bound to host loopback, or replace the token
 before exposing the container to another network.
 
+## KVM sandbox deployment
+
+`sandbox_session` requires microsandbox hardware virtualization. The current
+production topology must run on a Linux host where `/dev/kvm` exists and is
+readable and writable by the container's agentd user. Provision at least 8
+logical CPUs and 8 GiB RAM for the initial four-run configuration. Do not try
+to compensate for a missing KVM device with `--privileged`.
+
+The production image links microsandbox's SQLx state database to Debian's
+shared SQLite library so it can coexist with agentd's bundled libSQL. Linux
+source builds outside the image need `libcap-ng-dev`, `libsqlite3-dev`, and
+`pkg-config`, with `LIBSQLITE3_SYS_USE_PKG_CONFIG=1` set while compiling.
+
+1. Build and publish `Dockerfile.sandbox` with the container workflow. Copy the
+   resulting `ghcr.io/minifish-org/agentd-sandbox@sha256:...` digest into a
+   production copy of `configs/agentd.kvm.toml.example`.
+2. On the new host, verify `test -r /dev/kvm`, `test -w /dev/kvm`, and record
+   the numeric kvm group ID with `getent group kvm`.
+3. Stop the old agentd instance before copying its database volume. Never run
+   the old and new instances against the same SQLite database.
+4. Set `KVM_GID` and `AGENTD_CONFIG_PATH`, then deploy
+   `deploy/docker-compose.kvm.yml`. It maps only `/dev/kvm`, adds the kvm group,
+   and keeps agentd running as UID 10001 without `--privileged` or extra Linux
+   capabilities.
+5. Keep the `microsandbox-data` volume across restarts. On the first enabled
+   startup the pinned microsandbox SDK installs and verifies its matching
+   runtime bundle there; later starts reuse it and the OCI image cache.
+
+Sandbox remains an explicit agent permission. A canary agent must include, for
+example, `allowed_families = ["clock", "sandbox"]`; agents that omit
+`allowed_families` do not receive `sandbox_session`. Exercise repeated shell,
+Python and Node calls, a public `curl`, a non-zero command, a timed-out command,
+and cancellation. After each terminal run, verify that microsandbox has no
+remaining `agentd-run-*` instance. Existing HTTP/stdio MCP registrations stay
+where they are and are not migrated into the sandbox.
+
+On an Apple Silicon development Mac, run `scripts/sandbox-canary.sh` natively
+from the repository. It uses an isolated temporary database and microsandbox
+state directory, runs the full/isolation/cancellation scenarios, and removes
+the temporary state afterward. Set `AGENTD_SANDBOX_TEST_IMAGE` to override its
+fixed public Debian canary image.
+
 ## Network boundary
 
 An unauthenticated deployment may listen only on a loopback address. Binding

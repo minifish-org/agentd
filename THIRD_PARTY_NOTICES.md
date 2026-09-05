@@ -1,5 +1,13 @@
 # Third-party notices
 
+## superradcompany/microsandbox
+
+agentd uses the Apache-2.0-licensed
+[`microsandbox`](https://github.com/superradcompany/microsandbox) Rust SDK at
+version `0.6.16` for run-scoped microVM command execution. The dependency and
+its runtime bundle remain subject to their upstream licenses. The standard
+Apache License 2.0 text is available in this repository's [`LICENSE`](LICENSE).
+
 ## intfloat/multilingual-e5-small
 
 agentd uses the weights from

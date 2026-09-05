@@ -35,6 +35,8 @@ libsql = { version = "=0.9.30", default-features = false, features = ["core"] }
 croner = "3"
 fastembed = { version = "=5.17.3", default-features = false, features = ["ort-download-binaries-rustls-tls"] }
 tokenizers = { version = "=0.22.2", default-features = false, features = ["onig"] }
+async-trait = "0.1"
+microsandbox = { version = "=0.6.16", default-features = false, features = ["net", "prebuilt"] }
 
 # Keep debug builds small: line tables are enough for backtraces/panics, but
 # drop the full DWARF symbols that bloat `target/debug` (per-dep + accumulated).

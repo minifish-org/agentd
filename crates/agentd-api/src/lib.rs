@@ -28,6 +28,7 @@ pub enum ToolFamily {
     Clock,
     Calc,
     Mcp,
+    Sandbox,
 }
 
 impl ToolFamily {
@@ -40,6 +41,7 @@ impl ToolFamily {
             Self::Clock => "clock",
             Self::Calc => "calc",
             Self::Mcp => "mcp",
+            Self::Sandbox => "sandbox",
         }
     }
 
@@ -52,6 +54,7 @@ impl ToolFamily {
             Self::Clock,
             Self::Calc,
             Self::Mcp,
+            Self::Sandbox,
         ]
     }
 }
@@ -505,6 +508,26 @@ impl ScheduleSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sandbox_requires_explicit_agent_opt_in() {
+        let spec = AgentSpec {
+            allowed_families: None,
+            limits: AgentLimits {
+                timeout_ms: 1,
+                max_steps: 1,
+            },
+            system_prompt: None,
+            model: None,
+            temperature: None,
+            max_tokens: None,
+            context_window: None,
+        };
+        assert!(!spec
+            .effective_allowed_families()
+            .contains(&ToolFamily::Sandbox));
+        assert!(ToolFamily::all().contains(&ToolFamily::Sandbox));
+    }
 
     fn schedule() -> ScheduleSpec {
         ScheduleSpec {

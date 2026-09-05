@@ -37,6 +37,19 @@ llm_model = "local/chat"
 # baseline.
 # default_chat_system_prompt = "..."
 
+# Optional run-scoped microVM command execution. Leave this absent for normal
+# local development. See configs/agentd.kvm.toml.example and docs/deployment.md
+# before enabling it on a KVM-capable Linux host.
+# [sandbox]
+# enabled = true
+# image = "ghcr.io/minifish-org/agentd-sandbox@sha256:5c80ee1cc27e784074cdb4132583e00284355920bf7f03f7562b13e581b1759e"
+# cpus = 1
+# memory_mib = 512
+# default_command_timeout_ms = 30000
+# max_command_timeout_ms = 60000
+# max_output_bytes_per_stream = 524288
+# state_dir = "${HOME}/Library/Application Support/agentd/microsandbox"
+
 # agentd is transport-neutral: drive agents over the tenant turn endpoint and
 # read results from the run output or delivery outbox. The built-in console is
 # served at `/`. Telegram and other transports remain external adapters.

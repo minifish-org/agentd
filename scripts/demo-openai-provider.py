@@ -44,6 +44,15 @@ class DemoHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": str(error)})
             return
 
+        if model == "demo/sandbox-canary":
+            try:
+                response = self._sandbox_canary_response(model, messages)
+            except ValueError as error:
+                self._send_json(400, {"error": str(error)})
+                return
+            self._send_json(200, response)
+            return
+
         content = json.dumps(
             {"reply": "agentd completed a deterministic demo turn"},
             separators=(",", ":"),
@@ -86,6 +95,115 @@ class DemoHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _sandbox_canary_response(
+        self, model: str, messages: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        scenario = None
+        for message in messages:
+            if message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if not isinstance(content, str):
+                continue
+            try:
+                payload = json.loads(content)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                input_value = payload.get("input")
+                if isinstance(input_value, dict):
+                    scenario = input_value.get("scenario")
+        if scenario not in {"full", "isolation", "cancel"}:
+            raise ValueError("sandbox canary requires scenario full, isolation, or cancel")
+
+        tool_results = [message for message in messages if message.get("role") == "tool"]
+        plans: dict[str, list[dict[str, Any]]] = {
+            "full": [
+                {
+                    "action": "shell",
+                    "script": "command -v curl >/dev/null && command -v python3 >/dev/null && command -v node >/dev/null || (apt-get update -qq && apt-get install -y -qq --no-install-recommends ca-certificates curl python3 nodejs)",
+                    "timeout_ms": 60000,
+                },
+                {
+                    "action": "shell",
+                    "script": "printf persistent > state.txt && printf %s \"$VALUE\"",
+                    "env": {"VALUE": "env-ok"},
+                },
+                {"action": "exec", "command": "cat", "args": ["state.txt"]},
+                {
+                    "action": "exec",
+                    "command": "python3",
+                    "args": ["-c", "print('python-ok')"],
+                },
+                {
+                    "action": "exec",
+                    "command": "node",
+                    "args": ["-e", "console.log('node-ok')"],
+                },
+                {
+                    "action": "exec",
+                    "command": "curl",
+                    "args": ["-fsS", "https://example.com"],
+                },
+                {
+                    "action": "shell",
+                    "script": "printf nonzero >&2; exit 7",
+                },
+                {"action": "shell", "script": "sleep 2", "timeout_ms": 50},
+            ],
+            "isolation": [
+                {
+                    "action": "shell",
+                    "script": "test ! -e /workspace/state.txt && printf isolated",
+                }
+            ],
+            "cancel": [
+                {
+                    "action": "shell",
+                    "script": "printf started; sleep 60",
+                    "timeout_ms": 60000,
+                }
+            ],
+        }
+        plan = plans[scenario]
+        if len(tool_results) < len(plan):
+            call_number = len(tool_results) + 1
+            arguments = json.dumps(plan[len(tool_results)], separators=(",", ":"))
+            message: dict[str, Any] = {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": f"sandbox-canary-{scenario}-{call_number}",
+                        "type": "function",
+                        "function": {
+                            "name": "sandbox_session",
+                            "arguments": arguments,
+                        },
+                    }
+                ],
+            }
+            finish_reason = "tool_calls"
+        else:
+            message = {
+                "role": "assistant",
+                "content": json.dumps(
+                    {"reply": f"sandbox canary {scenario} complete"},
+                    separators=(",", ":"),
+                ),
+            }
+            finish_reason = "stop"
+        return {
+            "id": f"chatcmpl-sandbox-canary-{scenario}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [
+                {"index": 0, "message": message, "finish_reason": finish_reason}
+            ],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }
 
     def log_message(self, format: str, *args: Any) -> None:
         return

@@ -2,14 +2,20 @@ use crate::AppState;
 use agentd_api::AgentRunStatus;
 use anyhow::Result;
 use chrono::Utc;
-use std::time::Duration;
+use std::{sync::atomic::Ordering, time::Duration};
 
 pub(crate) async fn run_local_dispatch_loop(state: AppState) {
     let mut interval =
         tokio::time::interval(Duration::from_millis(state.dispatch_poll_interval_ms));
     loop {
+        if state.shutting_down.load(Ordering::SeqCst) {
+            break;
+        }
         interval.tick().await;
         loop {
+            if state.shutting_down.load(Ordering::SeqCst) {
+                break;
+            }
             let Ok(permit) = state.run_permits.clone().try_acquire_owned() else {
                 break;
             };
@@ -36,7 +42,15 @@ pub(crate) async fn run_local_dispatch_loop(state: AppState) {
                 }
                 task_state.running_tasks.lock().await.remove(&run_id);
             });
-            state.running_tasks.lock().await.insert(run_id, handle);
+            let mut running_tasks = state.running_tasks.lock().await;
+            if state.shutting_down.load(Ordering::SeqCst) {
+                handle.abort();
+                drop(running_tasks);
+                let _ = state.store.fail_run(run_id, "server shutting down").await;
+                break;
+            }
+            running_tasks.insert(run_id, handle);
+            drop(running_tasks);
             let _ = start_tx.send(());
         }
     }
@@ -57,8 +71,11 @@ async fn execute_local_run_if_running(
 
 pub(crate) async fn execute_local_run(
     state: AppState,
-    assigned: agentd_store::AssignedRun,
+    mut assigned: agentd_store::AssignedRun,
 ) -> Result<()> {
+    state
+        .capabilities
+        .retain_available_tools(&mut assigned.visible_tools);
     state
         .store
         .append_event(
@@ -74,8 +91,12 @@ pub(crate) async fn execute_local_run(
     )
     .await
     {
-        Ok(report) => report?,
+        Ok(report) => report,
         Err(_) => {
+            state
+                .capabilities
+                .cleanup_sandbox_run(assigned.run.run_id)
+                .await;
             state
                 .store
                 .fail_run(assigned.run.run_id, "run timeout exceeded")
@@ -83,6 +104,11 @@ pub(crate) async fn execute_local_run(
             return Ok(());
         }
     };
+    state
+        .capabilities
+        .cleanup_sandbox_run(assigned.run.run_id)
+        .await;
+    let report = report?;
     if let Some(error) = report.error {
         state.store.fail_run(assigned.run.run_id, &error).await?;
         return Ok(());
@@ -157,6 +183,7 @@ mod tests {
             run_permits: Arc::new(Semaphore::new(1)),
             running_tasks: Arc::new(Mutex::new(Default::default())),
             dispatch_poll_interval_ms: 1,
+            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         execute_local_run_if_running(state, assigned).await.unwrap();

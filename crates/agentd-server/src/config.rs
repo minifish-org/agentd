@@ -4,6 +4,7 @@ use serde::Deserialize;
 use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 #[derive(Parser)]
@@ -62,13 +63,92 @@ pub(crate) struct Config {
     /// Operator-supplied fallback `system_prompt` for an agent without a persona.
     #[serde(default)]
     pub(crate) default_chat_system_prompt: Option<String>,
+    #[serde(default)]
+    pub(crate) sandbox: Option<SandboxConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SandboxConfig {
+    #[serde(default)]
+    pub(crate) enabled: bool,
+    #[serde(default)]
+    pub(crate) image: Option<String>,
+    #[serde(default = "default_sandbox_cpus")]
+    pub(crate) cpus: u8,
+    #[serde(default = "default_sandbox_memory_mib")]
+    pub(crate) memory_mib: u32,
+    #[serde(default = "default_sandbox_command_timeout_ms")]
+    pub(crate) default_command_timeout_ms: u64,
+    #[serde(default = "default_sandbox_max_command_timeout_ms")]
+    pub(crate) max_command_timeout_ms: u64,
+    #[serde(default = "default_sandbox_output_bytes")]
+    pub(crate) max_output_bytes_per_stream: usize,
+    #[serde(default)]
+    pub(crate) state_dir: Option<String>,
+}
+
+fn default_sandbox_cpus() -> u8 {
+    1
+}
+
+fn default_sandbox_memory_mib() -> u32 {
+    512
+}
+
+fn default_sandbox_command_timeout_ms() -> u64 {
+    30_000
+}
+
+fn default_sandbox_max_command_timeout_ms() -> u64 {
+    60_000
+}
+
+fn default_sandbox_output_bytes() -> usize {
+    512 * 1024
 }
 
 impl Config {
     pub(crate) fn resolve_runtime_paths(&mut self) -> Result<()> {
         let home = std::env::var_os("HOME").map(PathBuf::from);
         self.database_path = resolve_home_path(&self.database_path, home.as_deref())?;
+        if let Some(state_dir) = self
+            .sandbox
+            .as_mut()
+            .and_then(|sandbox| sandbox.state_dir.as_mut())
+        {
+            *state_dir = resolve_home_path(state_dir, home.as_deref())?;
+        }
         Ok(())
+    }
+
+    pub(crate) fn sandbox_runtime_config(
+        &self,
+    ) -> Result<Option<agentd_core::SandboxManagerConfig>> {
+        let Some(sandbox) = self.sandbox.as_ref().filter(|sandbox| sandbox.enabled) else {
+            return Ok(None);
+        };
+        let image = sandbox
+            .image
+            .as_deref()
+            .filter(|image| !image.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("sandbox.image is required when sandbox is enabled"))?;
+        let state_dir = sandbox
+            .state_dir
+            .as_deref()
+            .filter(|path| !path.trim().is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("sandbox.state_dir is required when sandbox is enabled")
+            })?;
+        Ok(Some(agentd_core::SandboxManagerConfig {
+            image: image.to_string(),
+            cpus: sandbox.cpus,
+            memory_mib: sandbox.memory_mib,
+            default_command_timeout: Duration::from_millis(sandbox.default_command_timeout_ms),
+            max_command_timeout: Duration::from_millis(sandbox.max_command_timeout_ms),
+            max_output_bytes_per_stream: sandbox.max_output_bytes_per_stream,
+            state_dir: PathBuf::from(state_dir),
+        }))
     }
 
     pub(crate) fn rest_listener(&self) -> Result<SocketAddr> {
@@ -110,7 +190,7 @@ fn resolve_home_path(raw: &str, home: Option<&Path>) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{resolve_home_path, Config};
-    use std::{net::SocketAddr, path::Path};
+    use std::{net::SocketAddr, path::Path, time::Duration};
 
     fn config_with(rest_addr: &str, api_token: Option<&str>) -> Config {
         let token = api_token
@@ -195,5 +275,60 @@ scheduler_tick_ms = 1000
                 .unwrap(),
             "0.0.0.0:8080".parse::<SocketAddr>().unwrap()
         );
+    }
+
+    #[test]
+    fn sandbox_config_is_optional_and_disabled_by_default() {
+        let config = config_with("127.0.0.1:8080", None);
+        assert!(config.sandbox_runtime_config().unwrap().is_none());
+
+        let config: Config = toml::from_str(
+            r#"
+rest_addr = "127.0.0.1:8080"
+database_path = "/tmp/agentd.db"
+scheduler_tick_ms = 1000
+
+[sandbox]
+enabled = false
+"#,
+        )
+        .unwrap();
+        assert!(config.sandbox_runtime_config().unwrap().is_none());
+    }
+
+    #[test]
+    fn enabled_sandbox_uses_bounded_defaults_and_requires_paths() {
+        let config: Config = toml::from_str(
+            r#"
+rest_addr = "127.0.0.1:8080"
+database_path = "/tmp/agentd.db"
+scheduler_tick_ms = 1000
+
+[sandbox]
+enabled = true
+image = "ghcr.io/minifish-org/agentd-sandbox@sha256:test"
+state_dir = "/var/lib/agentd/microsandbox"
+"#,
+        )
+        .unwrap();
+        let sandbox = config.sandbox_runtime_config().unwrap().unwrap();
+        assert_eq!(sandbox.cpus, 1);
+        assert_eq!(sandbox.memory_mib, 512);
+        assert_eq!(sandbox.default_command_timeout, Duration::from_secs(30));
+        assert_eq!(sandbox.max_command_timeout, Duration::from_secs(60));
+        assert_eq!(sandbox.max_output_bytes_per_stream, 512 * 1024);
+
+        let missing: Config = toml::from_str(
+            r#"
+rest_addr = "127.0.0.1:8080"
+database_path = "/tmp/agentd.db"
+scheduler_tick_ms = 1000
+
+[sandbox]
+enabled = true
+"#,
+        )
+        .unwrap();
+        assert!(missing.sandbox_runtime_config().is_err());
     }
 }

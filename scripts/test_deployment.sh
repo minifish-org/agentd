@@ -8,6 +8,7 @@ bash -n "$root/scripts/fetch-embedding-model.sh"
 bash -n "$root/scripts/fetch-reranker-model.sh"
 bash -n "$root/scripts/test-demo-provider.sh"
 bash -n "$root/scripts/demo-e2e.sh"
+bash -n "$root/scripts/sandbox-canary.sh"
 bash -n "$root/scripts/release-version.sh"
 python3 -c 'import sys; compile(open(sys.argv[1], encoding="utf-8").read(), sys.argv[1], "exec")' \
   "$root/scripts/demo-openai-provider.py"

@@ -1,0 +1,23 @@
+# Production KVM example. Replace every placeholder before use and pin the
+# sandbox image to the digest emitted by the container publishing workflow.
+rest_addr = "0.0.0.0:8080"
+database_path = "/var/lib/agentd/agentd.db"
+scheduler_tick_ms = 1000
+run_concurrency = 4
+dispatch_poll_interval_ms = 250
+http_timeout_secs = 90
+api_token = "REPLACE_WITH_A_HIGH_ENTROPY_TOKEN"
+
+llm_api_base = "http://host.docker.internal:8000/v1"
+llm_api_key = ""
+llm_model = "local/chat"
+
+[sandbox]
+enabled = true
+image = "ghcr.io/minifish-org/agentd-sandbox@sha256:5c80ee1cc27e784074cdb4132583e00284355920bf7f03f7562b13e581b1759e"
+cpus = 1
+memory_mib = 512
+default_command_timeout_ms = 30000
+max_command_timeout_ms = 60000
+max_output_bytes_per_stream = 524288
+state_dir = "/var/lib/agentd/microsandbox"

@@ -1,0 +1,21 @@
+services:
+  agentd:
+    image: ghcr.io/minifish-org/agentd:latest
+    restart: unless-stopped
+    user: "10001"
+    group_add:
+      - "${KVM_GID:?set KVM_GID to the host kvm group id}"
+    devices:
+      - /dev/kvm:/dev/kvm
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    ports:
+      - 127.0.0.1:8080:8080
+    volumes:
+      - agentd-data:/var/lib/agentd
+      - microsandbox-data:/var/lib/agentd/microsandbox
+      - ${AGENTD_CONFIG_PATH:?set AGENTD_CONFIG_PATH to the production TOML}:/etc/agentd/agentd.toml:ro
+
+volumes:
+  agentd-data:
+  microsandbox-data:

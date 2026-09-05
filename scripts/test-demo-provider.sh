@@ -43,6 +43,20 @@ content = payload["choices"][0]["message"]["content"]
 assert json.loads(content)["reply"] == "agentd completed a deterministic demo turn"
 '
 
+canary=$(curl --fail --silent --show-error \
+  -H 'content-type: application/json' \
+  -d '{"model":"demo/sandbox-canary","messages":[{"role":"user","content":"{\"input\":{\"scenario\":\"full\"}}"}]}' \
+  "http://127.0.0.1:$port/v1/chat/completions")
+printf '%s' "$canary" | python3 -c '
+import json, sys
+payload = json.load(sys.stdin)
+choice = payload["choices"][0]
+call = choice["message"]["tool_calls"][0]
+assert choice["finish_reason"] == "tool_calls"
+assert call["function"]["name"] == "sandbox_session"
+assert json.loads(call["function"]["arguments"])["action"] == "shell"
+'
+
 status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
   -H 'content-type: application/json' \
   -d '{"messages":[]}' \

@@ -108,7 +108,9 @@ curl -X PUT http://127.0.0.1:8080/v1/tenants/demo/agents/simple-bot \
 
 Agent JSON/TOML is flat: `persona`, `model`, `allowed_families`, `timeout_ms`,
 `max_steps`, `temperature`, `max_tokens`, and `context_window`. Omitting
-`allowed_families` exposes every family; `allowed_families = []` exposes none.
+`allowed_families` exposes every baseline family but never the privileged
+`sandbox` family; add `sandbox` explicitly to opt an agent into command
+execution. `allowed_families = []` exposes none.
 `context_window` counts complete user/assistant turns, and `0` disables context.
 
 ## Submit a turn
@@ -132,12 +134,16 @@ idempotency key.
 
 ## Tools
 
-There are 17 built-ins: artifact read/write/list; memory get/search/list/put/delete;
+There are 18 built-ins: artifact read/write/list; memory get/search/list/put/delete;
 graph query; schedule get/list/put/delete; clock now; public-web search/fetch;
-and pure arithmetic. Names are canonical capability names. Mutating tools execute
-when their family is allowed; there is no generic operator execute endpoint or
-approval workflow. Shell, arbitrary HTTP, audio, run, plan, LLM, output,
-dialog, and context tools do not exist.
+pure arithmetic; and the optional `sandbox_session`. Names are canonical
+capability names. Mutating tools execute when their family is allowed; there is
+no generic operator execute endpoint or approval workflow. `sandbox_session`
+is registered only when the host enables microsandbox and the agent explicitly
+allows the `sandbox` family. It offers `exec` and `/bin/bash -lc` actions in one
+run-scoped microVM; repeated calls share guest files, and terminal run paths
+destroy the VM. There are no model-visible session IDs, host mounts, persistent
+cross-run sandboxes, audio, plan, LLM, output, dialog, or context tools.
 
 Memory writes embed the concise canonical text before committing it. The
 runtime contains pinned INT8 ONNX builds of `intfloat/multilingual-e5-small`

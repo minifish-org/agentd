@@ -9,6 +9,7 @@ mod handlers;
 mod llm_provider;
 mod mcp_client;
 mod reranking_provider;
+mod sandbox;
 mod storage;
 mod time_utils;
 
@@ -20,6 +21,8 @@ pub use embedding_provider::{
 pub use mcp_client::discover_tools as discover_mcp_tools;
 pub use reranking_provider::{BUILTIN_RERANKER_ARTIFACT_ID, BUILTIN_RERANKER_MODEL_ID};
 pub use runtime::{ExecutionReport, RuntimeEngine};
+use sandbox::RunExecutionContext;
+pub use sandbox::{SandboxManagerConfig, SandboxSessionManager};
 
 const DEFAULT_CHAT_SYSTEM_PROMPT: &str = "You are a transport-neutral agent. \
 The caller's current input is provided as JSON under `input`; earlier messages \
@@ -106,6 +109,7 @@ pub struct CapabilityEngine {
     embedding: embedding_provider::BuiltInEmbedding,
     reranker: reranking_provider::BuiltInReranker,
     default_chat_system_prompt: Option<String>,
+    sandbox: Option<SandboxSessionManager>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -154,6 +158,45 @@ impl CapabilityEngine {
             embedding: embedding_provider::BuiltInEmbedding::default(),
             reranker: reranking_provider::BuiltInReranker::default(),
             default_chat_system_prompt: cfg.default_chat_system_prompt,
+            sandbox: None,
+        }
+    }
+
+    pub fn with_sandbox_manager(mut self, manager: SandboxSessionManager) -> Self {
+        self.sandbox = Some(manager);
+        self
+    }
+
+    pub fn sandbox_enabled(&self) -> bool {
+        self.sandbox.is_some()
+    }
+
+    pub fn retain_available_tools(&self, tools: &mut Vec<ToolSpec>) {
+        if self.sandbox.is_none() {
+            tools.retain(|tool| tool.family != ToolFamily::Sandbox);
+        }
+    }
+
+    pub async fn cleanup_sandbox_run(&self, run_id: uuid::Uuid) {
+        if let Some(manager) = &self.sandbox {
+            if let Err(error) = manager.destroy_run(run_id).await {
+                tracing::warn!(run_id = %run_id, error = %error, "sandbox cleanup failed");
+            }
+        }
+    }
+
+    pub async fn cleanup_all_sandboxes(&self) {
+        if let Some(manager) = &self.sandbox {
+            if let Err(error) = manager.destroy_all().await {
+                tracing::warn!(error = %error, "sandbox shutdown cleanup failed");
+            }
+        }
+    }
+
+    pub async fn reap_sandbox_orphans(&self) -> Result<usize> {
+        match &self.sandbox {
+            Some(manager) => manager.reap_orphans().await,
+            None => Ok(0),
         }
     }
 
@@ -165,6 +208,7 @@ impl CapabilityEngine {
 
     pub(crate) async fn execute_tool(
         &self,
+        context: &RunExecutionContext,
         tenant: &str,
         tool: &ToolSpec,
         params: &serde_json::Value,
@@ -180,6 +224,11 @@ impl CapabilityEngine {
             match self.resolve_mcp_invocation_target(tenant, tool).await {
                 Ok(target) => self.mcp.call_tool(&target, params).await,
                 Err(error) => Err(error),
+            }
+        } else if tool.family == ToolFamily::Sandbox {
+            match &self.sandbox {
+                Some(manager) => manager.execute(context, params).await,
+                None => Err(anyhow!("sandbox capability is disabled")),
             }
         } else {
             self.execute_builtin_tool(tenant, &tool.name, params).await

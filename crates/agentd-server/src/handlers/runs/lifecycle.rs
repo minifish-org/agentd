@@ -116,7 +116,9 @@ pub(crate) async fn cancel_run(
                 Ok(status) => {
                     if let Some(handle) = state.running_tasks.lock().await.remove(&run_id) {
                         handle.abort();
+                        let _ = handle.await;
                     }
+                    state.capabilities.cleanup_sandbox_run(run_id).await;
                     (StatusCode::OK, Json(serde_json::json!({"status": status}))).into_response()
                 }
                 Err(error) => error_response(error),

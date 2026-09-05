@@ -1,11 +1,13 @@
 use crate::llm_provider::extract_openai_message_content;
-use crate::{CapabilityEngine, ToolResult};
+use crate::{CapabilityEngine, RunExecutionContext, ToolResult};
 use agentd_api::{ToolFamily, ToolSpec};
 use agentd_store::{AgentdStore, AssignedRun};
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::time::Duration;
+use tokio::time::Instant;
 
 const DEFAULT_CONTEXT_TURNS: usize = 20;
 const MAX_WEB_TOOL_CALLS_PER_RUN: usize = 6;
@@ -190,7 +192,15 @@ impl RuntimeEngine {
     }
 
     pub async fn execute_assigned_run(&self, assigned: &AssignedRun) -> Result<ExecutionReport> {
-        match self.run_agent(assigned).await {
+        let run = &assigned.run;
+        let context = RunExecutionContext {
+            run_id: run.run_id,
+            tenant: run.tenant.clone(),
+            agent_ref: run.agent_ref.clone(),
+            scope: run.scope.clone(),
+            deadline: Instant::now() + Duration::from_millis(assigned.timeout_ms.max(1)),
+        };
+        match self.run_agent(assigned, &context).await {
             Ok(()) => Ok(ExecutionReport { error: None }),
             Err(error) => Ok(ExecutionReport {
                 error: Some(error.to_string()),
@@ -198,7 +208,7 @@ impl RuntimeEngine {
         }
     }
 
-    async fn run_agent(&self, assigned: &AssignedRun) -> Result<()> {
+    async fn run_agent(&self, assigned: &AssignedRun, context: &RunExecutionContext) -> Result<()> {
         let run = &assigned.run;
         let mut maintenance_scan = MemoryMaintenanceScan::for_run(&run.agent_ref, &run.input)?;
         let prior_state = self
@@ -337,7 +347,11 @@ impl RuntimeEngine {
                     Some(tool) if !tool_budget.admit(tool) => tool_error(
                         "web tool call budget exceeded; answer using results already collected",
                     ),
-                    Some(tool) => self.caps.execute_tool(&run.tenant, tool, &arguments).await,
+                    Some(tool) => {
+                        self.caps
+                            .execute_tool(context, &run.tenant, tool, &arguments)
+                            .await
+                    }
                     None => tool_error("tool is not visible to this agent"),
                 };
                 self.store

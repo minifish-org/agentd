@@ -10,7 +10,7 @@ REST turn / due schedule
       queued run -- transactional (tenant, agent, scope) claim
           |
           v
-  context → model ⇄ allowed built-in/MCP tools
+  context → model ⇄ allowed built-in/MCP/sandbox tools
           |
           v
  transaction: output + terminal trace + context + optional delivery reference
@@ -29,6 +29,10 @@ REST turn / due schedule
   is the raw execution trace.
 - External transports call REST and consume the outbox. They never link core
   code or read the database.
+- An enabled `sandbox_session` lazily assigns one microsandbox microVM to a run.
+  The run ID is the internal lifecycle key; models see only `exec` and `shell`.
+  Guest files persist between calls in that run and are destroyed at every
+  terminal path. Sandbox metadata is not stored in agentd's database.
 
 ## Persistence
 
@@ -74,6 +78,6 @@ primitive.
 
 There is no independent CLI, Controller forwarding layer, general compatibility
 parser or migration framework beyond the explicit v6→v7 step, derived audit
-database, replay simulator, review/approval queue, shell, arbitrary HTTP tool,
-audio tool, or multi-agent orchestration layer. New abstractions require an
-observed consumer.
+database, replay simulator, review/approval queue, host shell, dedicated
+arbitrary-HTTP tool, persistent sandbox session, audio tool, or multi-agent
+orchestration layer. New abstractions require an observed consumer.

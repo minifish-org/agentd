@@ -22,10 +22,12 @@ pub(crate) async fn list_tools(
                 .get_agent(&tenant, &agent_name)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("agent not found"))?;
-            state
+            let mut tools = state
                 .store
                 .list_visible_tools(&tenant, &agent.spec.effective_allowed_families())
-                .await
+                .await?;
+            state.capabilities.retain_available_tools(&mut tools);
+            Ok(tools)
         } else {
             let mut tools = state.store.list_tools();
             tools.extend(
@@ -34,6 +36,7 @@ pub(crate) async fn list_tools(
                     .list_visible_tools(&tenant, &[agentd_api::ToolFamily::Mcp])
                     .await?,
             );
+            state.capabilities.retain_available_tools(&mut tools);
             Ok(tools)
         }
     }

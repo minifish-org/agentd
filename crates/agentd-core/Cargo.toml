@@ -16,11 +16,14 @@ sha2.workspace = true
 hex.workspace = true
 uuid.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 base64 = "0.22"
 regex = "1"
 meval = "0.2"
 fastembed.workspace = true
 tokenizers.workspace = true
+async-trait.workspace = true
+microsandbox.workspace = true
 agentd-api = { path = "../agentd-api" }
 agentd-store = { path = "../agentd-store" }
 

@@ -28,7 +28,14 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use tokio::sync::{Mutex, Semaphore};
 use tracing::info;
 
@@ -62,7 +69,15 @@ pub(crate) async fn run_server(config_path: &str, reset_data: bool) -> Result<()
 
     let store = AgentdStore::new(&cfg.database_path).await?;
     store.reset_local_runtime_state().await?;
-    let caps = CapabilityEngine::new_with_config(
+    let sandbox_manager = match cfg.sandbox_runtime_config()? {
+        Some(config) => Some(
+            agentd_core::SandboxSessionManager::new_microsandbox(config)
+                .await
+                .context("failed to initialize sandbox runtime")?,
+        ),
+        None => None,
+    };
+    let mut caps = CapabilityEngine::new_with_config(
         store.clone(),
         CapabilityEngineConfig {
             http_timeout_secs: cfg.http_timeout_secs,
@@ -72,6 +87,18 @@ pub(crate) async fn run_server(config_path: &str, reset_data: bool) -> Result<()
             default_chat_system_prompt: cfg.default_chat_system_prompt.clone(),
         },
     );
+    if let Some(manager) = sandbox_manager {
+        caps = caps.with_sandbox_manager(manager);
+        match caps.reap_sandbox_orphans().await {
+            Ok(reaped) if reaped > 0 => {
+                tracing::info!(count = reaped, "removed orphaned sandbox sessions");
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to remove every orphaned sandbox session");
+            }
+        }
+    }
     caps.warm_up_retrieval_models().await?;
 
     let runtime = RuntimeEngine::new(caps.clone(), store.clone());
@@ -88,17 +115,58 @@ pub(crate) async fn run_server(config_path: &str, reset_data: bool) -> Result<()
         run_permits: Arc::new(Semaphore::new(cfg.run_concurrency.unwrap_or(4).max(1))),
         running_tasks: Arc::new(Mutex::new(HashMap::new())),
         dispatch_poll_interval_ms: cfg.dispatch_poll_interval_ms.unwrap_or(250).max(25),
+        shutting_down: Arc::new(AtomicBool::new(false)),
     };
 
     rediscover_enabled_servers(&app_state).await;
     tokio::spawn(run_local_dispatch_loop(app_state.clone()));
 
-    let router = build_router(app_state, cfg.api_token.clone());
+    let router = build_router(app_state.clone(), cfg.api_token.clone());
 
-    let rest = axum::serve(tokio::net::TcpListener::bind(rest_listener).await?, router);
+    let shutdown_state = app_state.clone();
+    let rest = axum::serve(tokio::net::TcpListener::bind(rest_listener).await?, router)
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            shutdown_local_runtime(&shutdown_state).await;
+        });
     info!(rest = %cfg.rest_addr, "agentd single-host runtime listening");
-    rest.await?;
+    let result = rest.await;
+    app_state.capabilities.cleanup_all_sandboxes().await;
+    result?;
     Ok(())
+}
+
+async fn shutdown_local_runtime(state: &AppState) {
+    state.shutting_down.store(true, Ordering::SeqCst);
+    let handles: Vec<_> = state
+        .running_tasks
+        .lock()
+        .await
+        .drain()
+        .map(|(_, task)| task)
+        .collect();
+    for handle in handles {
+        handle.abort();
+        let _ = handle.await;
+    }
+    state.capabilities.cleanup_all_sandboxes().await;
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = terminate.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 pub(crate) fn build_router(app_state: AppState, api_token: Option<String>) -> Router {
@@ -197,6 +265,7 @@ mod tests {
             run_permits: Arc::new(Semaphore::new(2)),
             running_tasks: Arc::new(Mutex::new(HashMap::new())),
             dispatch_poll_interval_ms: 25,
+            shutting_down: Arc::new(AtomicBool::new(false)),
         };
         (dir, build_router(state, None))
     }
@@ -258,6 +327,12 @@ mod tests {
             .0,
             StatusCode::OK
         );
+        let (_, tools) = request(&app, Method::GET, "/v1/tenants/demo/tools?agent=bot", None).await;
+        assert!(!tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| { tool["name"] == "sandbox_session" || tool["family"] == "sandbox" }));
 
         let turn = json!({
             "agent":"bot",

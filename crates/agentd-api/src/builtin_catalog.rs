@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 /// The complete host-builtin catalog. Runtime mechanics are deliberately not
 /// tools: every entry below is a real capability the model may exercise.
 pub fn builtin_tool_catalog() -> Vec<ToolSpec> {
-    let mut tools = Vec::with_capacity(17);
+    let mut tools = Vec::with_capacity(18);
 
     add(
         &mut tools,
@@ -206,6 +206,41 @@ pub fn builtin_tool_catalog() -> Vec<ToolSpec> {
             "expression":{"type":"string","minLength":1}
         }}),
     );
+    add(
+        &mut tools,
+        ToolFamily::Sandbox,
+        "session",
+        "Run a command in the run-scoped sandbox. Repeated calls in one run share the same filesystem.",
+        true,
+        json!({
+            "type":"object",
+            "oneOf":[
+                {
+                    "additionalProperties":false,
+                    "required":["action","command"],
+                    "properties":{
+                        "action":{"const":"exec"},
+                        "command":{"type":"string","minLength":1},
+                        "args":{"type":"array","items":{"type":"string"}},
+                        "cwd":{"type":"string","minLength":1},
+                        "env":{"type":"object","additionalProperties":{"type":"string"}},
+                        "timeout_ms":{"type":"integer","minimum":1,"maximum":60000}
+                    }
+                },
+                {
+                    "additionalProperties":false,
+                    "required":["action","script"],
+                    "properties":{
+                        "action":{"const":"shell"},
+                        "script":{"type":"string","minLength":1},
+                        "cwd":{"type":"string","minLength":1},
+                        "env":{"type":"object","additionalProperties":{"type":"string"}},
+                        "timeout_ms":{"type":"integer","minimum":1,"maximum":60000}
+                    }
+                }
+            ]
+        }),
+    );
 
     tools
 }
@@ -250,7 +285,7 @@ mod tests {
     #[test]
     fn catalog_contains_only_real_capabilities() {
         let tools = builtin_tool_catalog();
-        assert_eq!(tools.len(), 17);
+        assert_eq!(tools.len(), 18);
         assert!(tools
             .iter()
             .all(|tool| ToolFamily::all().contains(&tool.family)));
@@ -262,5 +297,8 @@ mod tests {
             .iter()
             .any(|tool| tool.name == "graph_query" && !tool.mutating));
         assert_eq!(visible_tools(&tools, &[ToolFamily::Memory]).len(), 6);
+        assert!(tools.iter().any(|tool| {
+            tool.name == "sandbox_session" && tool.family == ToolFamily::Sandbox && tool.mutating
+        }));
     }
 }
