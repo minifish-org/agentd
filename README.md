@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/branding/agentd-logo-explorer-circle.png" alt="agentd — a little robot explorer under a summer sky" width="280">
+</p>
+
 # agentd
 
 agentd is an experimental, multi-tenant, single-agent runtime for one host. The
