@@ -39,6 +39,23 @@ turn. `delivery` is optional and must be explicit—scope is never a delivery
 destination. The trace endpoint returns stored `run_log` rows in insertion
 order.
 
+### Inline images
+
+An object payload may include `images`, an array of `{ "url": "data:image/jpeg;base64,...", "caption": "optional source label" }`.
+The native loop sends these as actual OpenAI-compatible `image_url` content parts,
+alongside the rest of the payload as text, and preserves them in rolling context.
+Text-only inputs retain the existing wire representation.
+
+Only inline base64 JPEG, PNG and WebP are accepted (up to 8 images, 128 KiB of
+decoded bytes per image, and 4096 bytes per caption). Remote URLs and SVG are
+rejected; adapters must retrieve, bound and resize media before submitting it.
+The runtime validates MIME signatures and base64, but does not decode images.
+The configured provider and model must independently support visual input.
+Invalid image input fails the asynchronous run. Image bytes are stored in run
+input and, when enabled, context; choose retention and context limits accordingly.
+
+### Schedules and other resources
+
 Schedule PUT accepts `agent_ref`, `scope`, `payload`, `enabled`, optional
 `delivery`, and exactly one of `at` or `cron`; cron also requires `timezone`.
 Setting `enabled=false` is the only pause mechanism.

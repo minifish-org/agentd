@@ -218,11 +218,7 @@ impl RuntimeEngine {
             .map(|context| context.state)
             .unwrap_or_else(|| json!({}));
         let prior_messages = context_messages(&prior_state, assigned.agent_context_turns);
-        let user_content = json!({
-            "input": run.input,
-            "source": run.source,
-        })
-        .to_string();
+        let user_content = crate::multimodal::user_content(&run.input, &run.source)?;
 
         let system_prompt = assigned
             .agent_system_prompt
@@ -595,17 +591,17 @@ fn model_message(message: &Value) -> Option<Value> {
     if !matches!(role, "user" | "assistant") {
         return None;
     }
-    let content = message
-        .get("content")
-        .or_else(|| message.get("text"))?
-        .as_str()?;
+    let content = message.get("content").or_else(|| message.get("text"))?;
+    if !content.is_string() && !content.is_array() {
+        return None;
+    }
     Some(json!({"role":role, "content":content}))
 }
 
 fn next_context_state(
     configured_turns: Option<usize>,
     mut messages: Vec<Value>,
-    user_content: &str,
+    user_content: &Value,
     output: &Value,
 ) -> Option<Value> {
     let turns = configured_turns.unwrap_or(DEFAULT_CONTEXT_TURNS);
@@ -691,14 +687,16 @@ mod tests {
 
     #[test]
     fn context_window_counts_complete_turns_and_zero_disables_it() {
-        assert!(next_context_state(Some(0), vec![], "input", &json!({"reply":"x"})).is_none());
+        assert!(
+            next_context_state(Some(0), vec![], &json!("input"), &json!({"reply":"x"})).is_none()
+        );
         let state = next_context_state(
             Some(1),
             vec![
                 json!({"role":"user", "content":"old"}),
                 json!({"role":"assistant", "content":"old reply"}),
             ],
-            "new",
+            &json!("new"),
             &json!({"reply":"new reply"}),
         )
         .unwrap();
@@ -730,6 +728,23 @@ mod tests {
         );
         assert!(parse_json_object("\"plain string\"").is_none());
         assert!(parse_json_object("[1,2,3]").is_none());
+    }
+
+    #[test]
+    fn multimodal_history_preserves_visual_content() {
+        let content = crate::multimodal::user_content(
+            &json!({"images":[{"url":crate::multimodal::tests::png()}]}),
+            "api",
+        )
+        .unwrap();
+        let state =
+            next_context_state(Some(1), vec![], &content, &json!({"reply":"seen"})).unwrap();
+        let history = context_messages(&state, Some(1));
+        assert_eq!(
+            super::model_message(&history[0]).unwrap()["content"],
+            content
+        );
+        assert!(super::model_message(&json!({"role":"system","content":content})).is_none());
     }
 
     #[test]
@@ -828,7 +843,12 @@ mod tests {
 
     #[tokio::test]
     async fn native_loop_commits_output_context_trace_and_delivery() {
-        async fn completion() -> Json<serde_json::Value> {
+        async fn completion(Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
+            assert_eq!(body["messages"][1]["content"][2]["type"], "image_url");
+            assert_eq!(
+                body["messages"][1]["content"][2]["image_url"]["url"],
+                crate::multimodal::tests::png()
+            );
             Json(json!({
                 "choices":[{"message":{"role":"assistant","content":"{\"reply\":\"ok\"}"}}]
             }))
@@ -879,7 +899,7 @@ mod tests {
                 ..CapabilityEngineConfig::default()
             },
         );
-        let input = json!({"text":"hello"});
+        let input = json!({"text":"hello", "images":[{"url":crate::multimodal::tests::png(),"caption":"test image"}]});
         let run_id = store
             .submit_run(NewRun {
                 tenant: "demo",

@@ -13,6 +13,7 @@ mod sandbox;
 mod storage;
 mod time_utils;
 
+mod multimodal;
 mod runtime;
 
 pub use embedding_provider::{
