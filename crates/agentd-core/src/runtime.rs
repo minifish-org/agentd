@@ -244,10 +244,10 @@ impl RuntimeEngine {
                 "messages": messages,
                 "temperature": assigned.agent_temperature.unwrap_or(0.2),
                 "max_tokens": assigned.agent_max_tokens.unwrap_or(4096),
-                "parallel_tool_calls": false,
                 "response_format": {"type":"json_object"},
             });
             if !tools.is_empty() {
+                request["parallel_tool_calls"] = json!(false);
                 request["tools"] = Value::Array(tools.clone());
                 request["tool_choice"] = json!("auto");
             }
@@ -844,6 +844,7 @@ mod tests {
     #[tokio::test]
     async fn native_loop_commits_output_context_trace_and_delivery() {
         async fn completion(Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
+            assert!(body.get("parallel_tool_calls").is_none());
             assert_eq!(body["messages"][1]["content"][2]["type"], "image_url");
             assert_eq!(
                 body["messages"][1]["content"][2]["image_url"]["url"],
