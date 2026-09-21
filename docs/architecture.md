@@ -34,6 +34,23 @@ REST turn / due schedule
   Guest files persist between calls in that run and are destroyed at every
   terminal path. Sandbox metadata is not stored in agentd's database.
 
+## Repeated-failure detection
+
+Each run has a small in-memory loop guard. Three consecutive calls with the
+same tool, structurally equal JSON arguments, and exactly the same failure
+produce one advisory reminder per streak. Success or a change in tool,
+arguments, or error resets the streak; identical successful polls do not warn.
+The guard retains only the current failure signature and its first three call
+IDs. It does not judge task completion, detect alternating loops, or stop a run.
+Existing step and timeout limits remain the bounds on execution.
+
+The reminder follows all tool results in the current model response. Its system
+text is fixed: tool arguments and errors stay in their original tool messages,
+not in system instructions. A `loop_guard` run-log event records the triggering
+step, tool name, three call IDs, repeat count, and reminder. The call IDs link
+back to the existing raw tool events. Guard state and reminders are not retained
+in cross-run conversation history.
+
 ## Persistence
 
 The schema is versioned. Startup creates v7 for an empty database and performs

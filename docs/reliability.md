@@ -16,6 +16,8 @@ reader can distinguish tested properties from design intent.
 | A successful run without a destination remains pull-only | `successful_run_without_delivery_stays_pull_only` | Store integration test |
 | Expired delivery claims can be reissued; retry updates the same row and validates the claim token | `expired_claim_is_reissued_and_retry_updates_one_row` | Store integration test |
 | The native model/tool loop commits output, context, trace, and delivery through the same path | `native_loop_commits_output_context_trace_and_delivery` | Core integration test with a deterministic provider |
+| Three identical consecutive tool failures warn once per streak; success or changed tool/arguments/error resets detection, and successful polling does not warn | `loop_guard_warns_once_per_streak_and_ignores_json_key_order`; `loop_guard_resets_on_success_or_changed_tool_arguments_or_error` | Core unit tests |
+| Loop reminders follow complete tool-result batches, are traced, allow a final response, and do not leak between runs | `loop_guard_reminder_follows_complete_tool_batch_and_allows_recovery` | Core integration test with a deterministic provider |
 | A cancelled assignment is not executed after dispatch registration | `cancelled_assignment_is_not_executed_after_dispatch_registration` | Server concurrency test |
 | Tenant REST paths cover turn, wait, trace, cancellation, artifact access, and removed-route rejection | `tenant_rest_turn_trace_cancel_artifact_and_removed_routes` | In-process HTTP integration test |
 | MCP catalogs are tenant-scoped and exposed tool names are unique within a tenant | `mcp_catalog_is_tenant_scoped`; `mcp_exposed_tool_names_must_be_unique_within_a_tenant` | Store integration tests |
