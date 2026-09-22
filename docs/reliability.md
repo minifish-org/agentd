@@ -8,6 +8,7 @@ reader can distinguish tested properties from design intent.
 
 | Behavior | Executable evidence | Scope |
 | --- | --- | --- |
+| The advertised `calc_eval` expression executes through schema validation and dispatch, while malformed and non-finite expressions fail | `calc_eval_executes_the_advertised_expression_contract` | Core integration test |
 | A tenant-scoped `request_id` deduplicates turn submission | `tenant_scoped_request_ids_are_idempotent` | Store integration test |
 | Runs sharing `(tenant, agent, scope)` serialize while unrelated scopes can proceed | `same_scope_serializes_while_other_scope_can_run` | Store integration test |
 | A missing agent fails a queued run without leaving its scope lane occupied | `missing_agent_fails_queued_run_without_stranding_its_lane` | Store integration test |

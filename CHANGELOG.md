@@ -6,6 +6,12 @@ not preserved unless a release note explicitly says otherwise.
 
 ## Unreleased
 
+### Fixed
+
+- `calc_eval` now reads the advertised `expression` argument, so valid native
+  tool calls execute without retrying contradictory `expr`/`expression` errors.
+  Its result payload keeps the existing `expr` and `result` fields.
+
 ### Added
 
 - Stable, bounded `memory_list` pagination with tenant/namespace-bound cursors.
