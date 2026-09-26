@@ -1,5 +1,6 @@
 pub(crate) mod agents;
 pub(crate) mod artifact;
+pub(crate) mod behavior;
 pub(crate) mod context;
 pub(crate) mod delivery_outbox;
 pub(crate) mod mcp;

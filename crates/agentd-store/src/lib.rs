@@ -2,7 +2,8 @@ use agentd_api::{
     builtin_tool_catalog, parse_timezone_offset, validate_cron_expression, validate_timezone_name,
     visible_tools, Agent, AgentResource, AgentRun, AgentRunStatus, DeliveryOutboxRecord, McpServer,
     McpToolInvocationTarget, Schedule, ScheduleSpec, ToolFamily, ToolSpec, ALL_MEMORY_NAMESPACES,
-    MEMORY_MAINTAINER_AGENT, MEMORY_MAINTENANCE_SCHEDULE,
+    BEHAVIOR_LEARNER_AGENT, BEHAVIOR_LEARNING_SCHEDULE, MEMORY_MAINTAINER_AGENT,
+    MEMORY_MAINTENANCE_SCHEDULE,
 };
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, FixedOffset, Utc};
@@ -21,6 +22,9 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use db::{LibsqlPool, Row};
+
+mod behavior;
+pub use behavior::{BehaviorLearningResult, BehaviorSnapshot};
 
 pub const MAX_MEMORY_TEXT_BYTES: usize = 4096;
 pub const MEMORY_EMBEDDING_DIM: usize = 384;
@@ -463,6 +467,12 @@ mod db {
         }
     }
 
+    impl IntoSqlValue for Option<i64> {
+        fn into_sql_value(self) -> Value {
+            self.map_or(Value::Null, Value::Integer)
+        }
+    }
+
     impl IntoSqlValue for i32 {
         fn into_sql_value(self) -> Value {
             Value::Integer(self as i64)
@@ -799,6 +809,8 @@ pub struct AssignedRun {
     pub agent_temperature: Option<f32>,
     pub agent_max_tokens: Option<u32>,
     pub agent_context_turns: Option<usize>,
+    pub agent_learned_instructions: Option<String>,
+    pub agent_behavior_revision: Option<u64>,
     pub visible_tools: Vec<ToolSpec>,
 }
 
@@ -1421,7 +1433,7 @@ impl AgentdStore {
     }
 
     async fn initialize_schema(&self) -> Result<()> {
-        const SCHEMA_VERSION: i64 = 8;
+        const SCHEMA_VERSION: i64 = 9;
         const GRAPH_MIGRATION_SCHEMA_VERSION: i64 = 6;
         const DELIVERY_PAYLOAD_SCHEMA_VERSION: i64 = 7;
         let version = db::query_scalar::<i64>("PRAGMA user_version")
@@ -1431,6 +1443,7 @@ impl AgentdStore {
         if version != 0
             && version != GRAPH_MIGRATION_SCHEMA_VERSION
             && version != DELIVERY_PAYLOAD_SCHEMA_VERSION
+            && version != 8
             && version != SCHEMA_VERSION
         {
             return Err(anyhow!(
@@ -1617,34 +1630,40 @@ impl AgentdStore {
             "CREATE INDEX idx_edges_incoming ON edges(tenant, namespace, target_entity_id, relation)",
         ];
         if version == 0 {
-            for statement in statements.into_iter().chain(graph_statements) {
+            for statement in statements
+                .into_iter()
+                .chain(graph_statements)
+                .chain(behavior::SCHEMA_STATEMENTS)
+            {
                 db::query(statement).execute(&self.pool).await?;
             }
-            db::query("PRAGMA user_version = 8")
+            db::query("PRAGMA user_version = 9")
                 .execute(&self.pool)
                 .await?;
-        } else if matches!(
-            version,
-            GRAPH_MIGRATION_SCHEMA_VERSION | DELIVERY_PAYLOAD_SCHEMA_VERSION
-        ) {
+        } else if version < SCHEMA_VERSION {
             let mut tx = self.pool.begin().await?;
             if version == GRAPH_MIGRATION_SCHEMA_VERSION {
                 for statement in graph_statements {
                     db::query(statement).execute(&mut tx).await?;
                 }
             }
-            db::query(
-                "ALTER TABLE deliveries ADD COLUMN payload_json TEXT NOT NULL DEFAULT 'null'",
-            )
-            .execute(&mut tx)
-            .await?;
-            db::query(
-                "UPDATE deliveries SET payload_json = COALESCE(\
-                 (SELECT output_json FROM runs WHERE runs.run_id = deliveries.run_id), 'null')",
-            )
-            .execute(&mut tx)
-            .await?;
-            db::query("PRAGMA user_version = 8")
+            if version <= DELIVERY_PAYLOAD_SCHEMA_VERSION {
+                db::query(
+                    "ALTER TABLE deliveries ADD COLUMN payload_json TEXT NOT NULL DEFAULT 'null'",
+                )
+                .execute(&mut tx)
+                .await?;
+                db::query(
+                    "UPDATE deliveries SET payload_json = COALESCE(\
+                     (SELECT output_json FROM runs WHERE runs.run_id = deliveries.run_id), 'null')",
+                )
+                .execute(&mut tx)
+                .await?;
+            }
+            for statement in behavior::SCHEMA_STATEMENTS {
+                db::query(statement).execute(&mut tx).await?;
+            }
+            db::query("PRAGMA user_version = 9")
                 .execute(&mut tx)
                 .await?;
             tx.commit().await?;
@@ -1657,6 +1676,32 @@ impl AgentdStore {
             return Err(anyhow!("tenant not found: {}", agent.metadata.tenant));
         }
         let now = Utc::now().to_rfc3339();
+        let mut tx = self.pool.begin().await?;
+        let previous_spec = db::query_scalar::<String>(
+            "SELECT spec_json FROM agents WHERE tenant = ? AND name = ?",
+        )
+        .bind(&agent.metadata.tenant)
+        .bind(&agent.metadata.name)
+        .fetch_optional(&mut tx)
+        .await?;
+        let spec_changed = previous_spec
+            .map(|raw| serde_json::from_str::<agentd_api::AgentSpec>(&raw))
+            .transpose()?
+            .is_some_and(|previous| previous != agent.spec);
+        if spec_changed
+            || agent.metadata.name.starts_with("system/")
+            || agent
+                .metadata
+                .labels
+                .get("agentd.system")
+                .is_some_and(|value| value == "true")
+        {
+            db::query("UPDATE behavior_heads SET active_revision = NULL WHERE tenant = ? AND agent_ref = ?")
+                .bind(&agent.metadata.tenant)
+                .bind(&agent.metadata.name)
+                .execute(&mut tx)
+                .await?;
+        }
         db::query(
             r#"INSERT INTO agents (tenant, name, metadata_json, spec_json, created_at, updated_at)
                VALUES (?, ?, ?, ?, ?, ?)
@@ -1671,8 +1716,9 @@ impl AgentdStore {
         .bind(serde_json::to_string(&agent.spec)?)
         .bind(&now)
         .bind(&now)
-        .execute(&self.pool)
+        .execute(&mut tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1870,6 +1916,28 @@ impl AgentdStore {
     }
     pub async fn put_schedule(&self, tenant: &str, name: &str, spec: &ScheduleSpec) -> Result<()> {
         spec.validate().map_err(|error| anyhow!(error))?;
+        let mut spec = spec.clone();
+        if spec.agent_ref == BEHAVIOR_LEARNER_AGENT {
+            if spec.delivery.is_some() {
+                return Err(anyhow!("behavior learning runs do not support delivery"));
+            }
+            let options: agentd_api::BehaviorLearningOptions =
+                serde_json::from_value(spec.payload.clone())
+                    .context("invalid behavior learning options")?;
+            options.validate().map_err(|error| anyhow!(error))?;
+            if options.target_agent == "*" {
+                if name != BEHAVIOR_LEARNING_SCHEDULE {
+                    return Err(anyhow!("wildcard behavior learning requires the reserved {BEHAVIOR_LEARNING_SCHEDULE} schedule"));
+                }
+            } else {
+                self.ensure_foreground_behavior_target(tenant, &options.target_agent)
+                    .await?;
+            }
+            spec.scope = format!("behavior-learning/{}", options.target_agent);
+            // Persist defaults explicitly so the scheduler sees '*' even when
+            // the caller supplies an empty options object.
+            spec.payload = serde_json::to_value(options)?;
+        }
         if self.get_tenant(tenant).await?.is_none() {
             return Err(anyhow!("tenant not found: {tenant}"));
         }
@@ -1877,7 +1945,7 @@ impl AgentdStore {
             return Err(anyhow!("unknown schedule agent: {}", spec.agent_ref));
         }
         let now = Utc::now();
-        let next_trigger_at = next_trigger_time(spec, now)?;
+        let next_trigger_at = next_trigger_time(&spec, now)?;
         let now_s = now.to_rfc3339();
         db::query(
             r#"INSERT INTO schedules (
@@ -1891,7 +1959,7 @@ impl AgentdStore {
         )
         .bind(tenant)
         .bind(name)
-        .bind(serde_json::to_string(spec)?)
+        .bind(serde_json::to_string(&spec)?)
         .bind(next_trigger_at.map(|value| value.to_rfc3339()))
         .bind(&now_s)
         .bind(&now_s)
@@ -1941,6 +2009,9 @@ impl AgentdStore {
     }
 
     pub async fn submit_run(&self, run: NewRun<'_>) -> Result<Uuid> {
+        if run.agent_ref == BEHAVIOR_LEARNER_AGENT && run.delivery_destination.is_some() {
+            return Err(anyhow!("behavior learning runs do not support delivery"));
+        }
         if run
             .delivery_destination
             .is_some_and(|destination| destination.trim().is_empty())
@@ -1952,6 +2023,32 @@ impl AgentdStore {
                 return Ok(existing.run_id);
             }
         }
+        let behavior_scope = if run.agent_ref == BEHAVIOR_LEARNER_AGENT {
+            let payload = if run
+                .input
+                .get("activation")
+                .and_then(serde_json::Value::as_str)
+                == Some("schedule")
+            {
+                run.input
+                    .get("input")
+                    .ok_or_else(|| anyhow!("behavior learning schedule payload is missing"))?
+            } else {
+                run.input
+            };
+            let options: agentd_api::BehaviorLearningOptions =
+                serde_json::from_value(payload.clone())
+                    .context("invalid behavior learning options")?;
+            options.validate().map_err(|error| anyhow!(error))?;
+            if options.target_agent == "*" {
+                return Err(anyhow!("behavior learning runs require a concrete target_agent; use the preset schedule for all agents"));
+            }
+            self.ensure_foreground_behavior_target(run.tenant, &options.target_agent)
+                .await?;
+            Some(format!("behavior-learning/{}", options.target_agent))
+        } else {
+            None
+        };
         if self.get_agent(run.tenant, run.agent_ref).await?.is_none() {
             return Err(anyhow!("agent not found: {}/{}", run.tenant, run.agent_ref));
         }
@@ -1968,7 +2065,7 @@ impl AgentdStore {
         .bind(run.tenant)
         .bind(run.name)
         .bind(run.agent_ref)
-        .bind(run.scope)
+        .bind(behavior_scope.as_deref().unwrap_or(run.scope))
         .bind(run.source)
         .bind(serde_json::to_string(run.input)?)
         .bind(status_to_wire(AgentRunStatus::Queued))
@@ -2338,6 +2435,11 @@ impl AgentdStore {
                 tx.rollback().await?;
                 continue;
             }
+            // Read the policy in the claim transaction and only pair it with
+            // the exact owner spec used for this assignment.
+            let active_revision =
+                behavior::active_revision_for_spec(&mut tx, &tenant, &agent_ref, &agent.spec)
+                    .await?;
             tx.commit().await?;
             run.status = AgentRunStatus::Running;
             run.started_at = Some(started_at);
@@ -2351,6 +2453,10 @@ impl AgentdStore {
                 agent_temperature: agent.spec.temperature,
                 agent_max_tokens: agent.spec.max_tokens,
                 agent_context_turns: agent.spec.context_window,
+                agent_learned_instructions: active_revision
+                    .as_ref()
+                    .map(|revision| revision.instructions.clone()),
+                agent_behavior_revision: active_revision.map(|revision| revision.revision),
                 visible_tools,
             }));
         }
@@ -2775,6 +2881,28 @@ impl AgentdStore {
                     triggered.push(run_id);
                     last_run_id = Some(run_id);
                 }
+            } else if name == BEHAVIOR_LEARNING_SCHEDULE
+                && spec.agent_ref == BEHAVIOR_LEARNER_AGENT
+                && spec
+                    .payload
+                    .get("target_agent")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("*")
+            {
+                for agent in self.list_agents(Some(&tenant)).await? {
+                    if !behavior::is_foreground_agent(&agent) {
+                        continue;
+                    }
+                    let mut run_spec = spec.clone();
+                    run_spec.payload["target_agent"] = json!(agent.name);
+                    run_spec.scope = format!("behavior-learning/{}", agent.name);
+                    let run_name = format!("{}-{}", name, Uuid::new_v4().simple());
+                    let run_id = self
+                        .submit_schedule_run(&tenant, &name, &run_spec, &run_name, now)
+                        .await?;
+                    triggered.push(run_id);
+                    last_run_id = Some(run_id);
+                }
             } else {
                 let run_name = format!("{}-{}", name, Uuid::new_v4().simple());
                 let run_id = self
@@ -2845,11 +2973,20 @@ impl AgentdStore {
     }
 
     pub async fn delete_agent(&self, tenant: &str, name: &str) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
         let result = db::query("DELETE FROM agents WHERE tenant = ? AND name = ?")
             .bind(tenant)
             .bind(name)
-            .execute(&self.pool)
+            .execute(&mut tx)
             .await?;
+        // A recreated name starts a new learning lifecycle. Immutable revision
+        // history remains available, but its policy and consumption cursor do not.
+        db::query("DELETE FROM behavior_heads WHERE tenant = ? AND agent_ref = ?")
+            .bind(tenant)
+            .bind(name)
+            .execute(&mut tx)
+            .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -2872,6 +3009,8 @@ impl AgentdStore {
             "memory",
             "schedules",
             "mcp_servers",
+            "behavior_heads",
+            "behavior_revisions",
             "agents",
         ] {
             db::query(&format!("DELETE FROM {table} WHERE tenant = ?"))
@@ -4376,7 +4515,7 @@ mod tests {
                 .fetch_optional(&migrated.pool)
                 .await
                 .unwrap(),
-            Some(8)
+            Some(9)
         );
         assert!(migrated
             .get_memory("one", "profile", "favorite")
@@ -4428,7 +4567,7 @@ mod tests {
                 .fetch_optional(&migrated.pool)
                 .await
                 .unwrap(),
-            Some(8)
+            Some(9)
         );
     }
 

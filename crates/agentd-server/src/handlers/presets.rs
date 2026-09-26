@@ -1,9 +1,11 @@
 use crate::{error_response, AppState};
 use agentd_api::{
-    AgentLimits, AgentResource, AgentSpec, ResourceMeta, ScheduleSpec, ToolFamily,
-    ALL_MEMORY_NAMESPACES, MEMORY_MAINTAINER_AGENT, MEMORY_MAINTENANCE_SCHEDULE,
+    AgentLimits, AgentResource, AgentSpec, BehaviorLearningOptions, ResourceMeta, ScheduleSpec,
+    ToolFamily, ALL_MEMORY_NAMESPACES, BEHAVIOR_LEARNER_AGENT, BEHAVIOR_LEARNING_SCHEDULE,
+    MEMORY_MAINTAINER_AGENT, MEMORY_MAINTENANCE_SCHEDULE,
 };
 use axum::{
+    body::Bytes,
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
@@ -172,6 +174,179 @@ pub(crate) async fn install_memory_maintenance(
             "agent_created": agent_created,
             "schedule_created": schedule_created,
             "schedule_updated": schedule_updated
+        })),
+    )
+        .into_response()
+}
+
+pub(crate) async fn install_behavior_learning(
+    State(state): State<AppState>,
+    Path(tenant): Path<String>,
+    body: Bytes,
+) -> impl IntoResponse {
+    match state.store.get_tenant(&tenant).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error":"tenant not found"})),
+            )
+                .into_response();
+        }
+        Err(error) => return error_response(error),
+    }
+    let options: BehaviorLearningOptions = if body.is_empty() {
+        BehaviorLearningOptions::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(options) => options,
+            Err(error) => return error_response(error),
+        }
+    };
+    if let Err(error) = options.validate() {
+        return error_response(error);
+    }
+    if options.target_agent != "*" {
+        match state.store.get_agent(&tenant, &options.target_agent).await {
+            Ok(Some(agent))
+                if !agent.name.starts_with("system/")
+                    && agent
+                        .metadata
+                        .labels
+                        .get("agentd.system")
+                        .map(String::as_str)
+                        != Some("true") => {}
+            Ok(Some(_)) => return error_response("learning target must be a foreground agent"),
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error":"target agent not found"})),
+                )
+                    .into_response();
+            }
+            Err(error) => return error_response(error),
+        }
+    }
+
+    let existing_agent = match state.store.get_agent(&tenant, BEHAVIOR_LEARNER_AGENT).await {
+        Ok(agent) => agent,
+        Err(error) => return error_response(error),
+    };
+    if existing_agent
+        .as_ref()
+        .is_some_and(|agent| !agent.spec.effective_allowed_families().is_empty())
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error":"reserved behavior learner exists with incompatible capabilities"
+            })),
+        )
+            .into_response();
+    }
+    let existing_schedule = match state
+        .store
+        .get_schedule(&tenant, BEHAVIOR_LEARNING_SCHEDULE)
+        .await
+    {
+        Ok(schedule) => schedule,
+        Err(error) => return error_response(error),
+    };
+    if existing_schedule
+        .as_ref()
+        .is_some_and(|schedule| schedule.spec.agent_ref != BEHAVIOR_LEARNER_AGENT)
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error":"reserved behavior schedule targets an incompatible agent"
+            })),
+        )
+            .into_response();
+    }
+
+    let agent_created = existing_agent.is_none();
+    let agent_updated = existing_agent
+        .as_ref()
+        .is_some_and(|agent| agent.spec.context_window != Some(0));
+    let agent = if let Some(mut existing) = existing_agent {
+        existing.spec.context_window = Some(0);
+        AgentResource {
+            metadata: existing.metadata,
+            spec: existing.spec,
+        }
+    } else {
+        AgentResource {
+            metadata: ResourceMeta {
+                name: BEHAVIOR_LEARNER_AGENT.to_string(),
+                tenant: tenant.clone(),
+                labels: BTreeMap::from([
+                    ("agentd.system".to_string(), "true".to_string()),
+                    ("agentd.preset".to_string(), "behavior-learning".to_string()),
+                ]),
+            },
+            spec: AgentSpec {
+                allowed_families: Some(vec![]),
+                limits: AgentLimits {
+                    timeout_ms: 900_000,
+                    max_steps: 64,
+                },
+                system_prompt: None,
+                model: None,
+                temperature: None,
+                max_tokens: None,
+                context_window: Some(0),
+            },
+        }
+    };
+    if agent_created || agent_updated {
+        if let Err(error) = agent.validate() {
+            return error_response(error);
+        }
+        if let Err(error) = state.store.apply_agent(&agent).await {
+            return error_response(error);
+        }
+    }
+    let schedule_created = existing_schedule.is_none();
+    if schedule_created {
+        let schedule = ScheduleSpec {
+            agent_ref: BEHAVIOR_LEARNER_AGENT.to_string(),
+            scope: if options.target_agent == "*" {
+                "behavior-learning".to_string()
+            } else {
+                format!("behavior-learning/{}", options.target_agent)
+            },
+            payload: match serde_json::to_value(&options) {
+                Ok(payload) => payload,
+                Err(error) => return error_response(error),
+            },
+            delivery: None,
+            at: None,
+            cron: Some("0 4 * * 0".to_string()),
+            timezone: Some("Asia/Singapore".to_string()),
+            enabled: false,
+        };
+        if let Err(error) = state
+            .store
+            .put_schedule(&tenant, BEHAVIOR_LEARNING_SCHEDULE, &schedule)
+            .await
+        {
+            return error_response(error);
+        }
+    }
+    (
+        if agent_created || schedule_created {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        },
+        Json(serde_json::json!({
+            "tenant": tenant,
+            "agent_ref": BEHAVIOR_LEARNER_AGENT,
+            "schedule": BEHAVIOR_LEARNING_SCHEDULE,
+            "agent_created": agent_created,
+            "agent_updated": agent_updated,
+            "schedule_created": schedule_created,
         })),
     )
         .into_response()

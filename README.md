@@ -10,8 +10,9 @@ persistence, scheduling, per-scope serialization, raw traces, and one pull
 delivery outbox.
 
 Database and HTTP compatibility are intentionally narrow. Runtime data remains
-disposable, but schema v6 is migrated in place to v7 so existing memory can gain
-the lightweight graph tables. Other schema mismatches require `--reset-data`.
+disposable, but schema versions 6–8 migrate in place to v9, preserving existing
+runtime data and adding behavior-learning state. Other schema mismatches
+require `--reset-data`.
 
 ## Runtime shape
 
@@ -34,12 +35,14 @@ claim run → read context → native model/tool loop
 ```
 
 The database has tenants, agents, runs, run log, contexts, artifacts, memory,
-lightweight entities and edges, schedules, deliveries, and MCP servers. Memory
+lightweight entities and edges, schedules, deliveries, MCP servers, and separate
+behavior-learning policies and revision history. Memory
 keeps one FTS5 index and one 384-dimension embedding BLOB per fact. Exact cosine
 and lexical ranks are combined with RRF; its top 10 are reranked to a final top
 5. Explicit relationships use ordinary SQL joins and bounded recursive CTEs in
-the same libSQL database. Replay is exactly the stored `run_log`; there is no
-derived replay, audit, inspection, simulation, or export control plane.
+the same libSQL database. Stored `run_log` rows remain the canonical trace.
+Optional behavior learning evaluates frozen historical decision inputs without
+executing tools.
 
 ## Start
 
@@ -185,6 +188,19 @@ maintainer retains no rolling context between runs. Enable or customize the
 schedule through the normal schedule API. Maintainer runs cannot succeed or
 mutate memory until they complete `memory_list` pagination for their input
 namespace.
+
+An optional `POST /v1/tenants/:tenant/presets/behavior-learning` preset installs
+a tool-free `system/behavior-learner` and a disabled weekly schedule. Once
+enabled, it automatically proposes instruction supplements for foreground
+agents, compares current and candidate next decisions on held-out historical
+inputs, and uses an independent model judge in both comparison orders. A
+candidate is promoted only when every evaluated case avoids regression and the
+mean gain meets the configured threshold. Trials execute no tools and retain no
+foreground context; learned instructions and history are separate from persona
+and business memory. This works through a standard chat API, including DeepSeek,
+and optimizes instructions rather than model weights. See
+[behavior learning](docs/behavior-learning.md) for setup, budgets, inspection,
+reset, and the limits of offline decision evaluation.
 
 MCP servers are tenant resources at `/v1/tenants/:tenant/mcp/:name`. Transport
 is a strict tagged object: stdio contains `command`, `args`, and optional

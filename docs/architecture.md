@@ -21,7 +21,8 @@ REST turn / due schedule
 - The model chooses real tools and the final JSON; host code validates and
   executes.
 - Tenant ownership applies to agents, runs, context, artifacts, memory and its
-  graph projection, schedules, MCP servers, and deliveries.
+  graph projection, schedules, MCP servers, deliveries, and behavior policies
+  and revision history.
 - Scope is both the rolling-context key and serialization key. Different
   scopes may run concurrently.
 - Context is a bounded conversation window; memory is explicit durable text
@@ -53,9 +54,8 @@ in cross-run conversation history.
 
 ## Persistence
 
-The schema is versioned. Startup creates v7 for an empty database and performs
-the one supported in-place migration from v6 to v7; unknown versions request
-`--reset-data`.
+The schema is versioned. Startup creates v9 for an empty database and migrates
+versions 6–8 in place; unknown versions request `--reset-data`.
 
 Important facts are stored once. Runs own activation, final output, and an
 optional requested destination; `run_log` owns model/tool/output/status/error
@@ -93,10 +93,29 @@ maintainer's own; its rolling context is disabled. There is no background
 agent type, heartbeat, cross-tenant maintainer, or host-side consolidation
 primitive.
 
+## Behavior learning
+
+The optional behavior-learning preset schedules a reserved coordinator for each
+foreground agent in a tenant. Its host-controlled loop uses independent
+model contexts to propose an instruction supplement, produce baseline
+and candidate next decisions from frozen historical request prefixes, and judge
+each pair in both presentation orders. Tool schemas and existing observations
+are part of that frozen evidence; generated tool calls are never executed.
+This evaluates offline decisions, not complete alternative trajectories.
+
+Development and held-out samples are separated by source run. All held-out
+cases must avoid regression and pass a mean improvement threshold before a
+proposal can become active. Promotion checks the target specification and
+parent revision, and commits the policy revision with the coordinator's
+terminal result. Ordinary claimed runs capture the active learned supplement
+alongside the owner-authored prompt. Dedicated policy/revision tables keep
+learning state outside business memory, artifacts, and rolling context.
+See [behavior learning](behavior-learning.md) for defaults and limitations.
+
 ## Deliberate omissions
 
 There is no independent CLI, Controller forwarding layer, general compatibility
-parser or migration framework beyond the explicit v6→v7 step, derived audit
-database, replay simulator, review/approval queue, host shell, dedicated
+parser or migration framework beyond the explicit supported schema migrations,
+derived audit database, external-side-effect replay simulator, review/approval queue, host shell, dedicated
 arbitrary-HTTP tool, persistent sandbox session, audio tool, or multi-agent
 orchestration layer. New abstractions require an observed consumer.

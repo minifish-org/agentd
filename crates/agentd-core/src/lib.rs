@@ -4,6 +4,7 @@ use anyhow::{anyhow, Result};
 use serde::Serialize;
 use std::time::Duration;
 
+mod behavior;
 mod embedding_provider;
 mod handlers;
 mod llm_provider;

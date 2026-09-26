@@ -12,7 +12,8 @@ query parameter.
 | Context | list/get/delete under `.../contexts/:agent` |
 | Artifact | list and `GET/PUT/DELETE .../artifacts/:path` |
 | Memory | `GET .../memory/:id`, `GET .../memory/search` |
-| Preset | `POST .../presets/memory-maintenance` |
+| Preset | `POST .../presets/memory-maintenance`, `POST .../presets/behavior-learning` |
+| Behavior learning | `GET/DELETE .../learning/:agent` |
 | Schedule | list and `GET/PUT/DELETE .../schedules/:name` |
 | Tool | `GET .../tools` |
 | MCP | list and `GET/PUT/DELETE .../mcp/:name` |
@@ -137,6 +138,28 @@ initial cursor-free `memory_list`, and requires
 every returned `next_cursor` to be followed until null. `memory_put` and
 `memory_delete` are rejected until enumeration completes, and a premature final
 response fails the run instead of accepting an unverified maintenance report.
+
+`POST .../presets/behavior-learning` accepts an optional JSON object of
+`BehaviorLearningOptions`; an empty body uses defaults. It creates a tool-free,
+context-free `system/behavior-learner` and a disabled weekly
+`system/behavior-learning` schedule with no delivery. `target_agent="*"`
+expands at schedule time into separate foreground-agent runs. A concrete target
+must exist in that tenant and must not be a system agent. Compatible existing
+schedule settings are preserved on reapply; the learner's context window is
+repaired to zero. Reserved-name conflicts return `409`.
+
+`GET .../learning/:agent` returns the active learned revision and a bounded
+20-entry revision history. `DELETE` clears the active supplement while retaining
+history and returns `{"tenant":"...","agent":"...","cleared":true|false}`.
+Unknown tenants or agents return `404`. Clearing is idempotent and does not
+disable future scheduled learning.
+
+Learning cycles compare one next assistant decision from frozen historical
+inputs, never execute the proposed tools, and automatically promote only
+candidates that pass held-out judge comparisons and concurrent-update checks.
+For an immediate cycle, submit a turn to `system/behavior-learner` with a
+concrete `target_agent` in its payload. See [behavior learning](behavior-learning.md)
+for options, budgets, examples, and the scope of these evaluations.
 
 Delivery ack:
 

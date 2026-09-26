@@ -1,9 +1,9 @@
 # Deployment
 
-agentd normally treats runtime data as replaceable. Schema v7 has one deliberate
-exception: an existing v6 database is migrated in place by adding the graph
-tables and indexes without rewriting memory rows. Back up the data directory
-before the first v7 start.
+agentd normally treats runtime data as replaceable. Schema v9 supports in-place
+migration from versions 6–8, preserving runtime data while adding the required
+graph, immutable delivery payload, and behavior-learning state. Back up the
+data directory before starting the new version against an existing database.
 
 The deployment image includes pinned INT8 ONNX and tokenizer assets for
 multilingual E5 Small and BGE reranker v2-m3. Startup verifies every asset
@@ -24,7 +24,7 @@ also includes both model licenses beside their assets and the repository's
 8. Verify the local and remote services and the Telegram decoy page.
 9. Delete the rollback data only after the checks pass.
 
-If startup reports a schema mismatch other than the supported v6→v7 migration,
+If startup reports a schema mismatch outside the supported v6–v8 migrations,
 use `agentd --reset-data`; do not add an ad hoc ALTER, backfill, repair endpoint,
 or legacy parser.
 

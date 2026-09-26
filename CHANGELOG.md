@@ -14,6 +14,12 @@ not preserved unless a release note explicitly says otherwise.
 
 ### Added
 
+- An optional per-tenant behavior-learning preset with a disabled schedule,
+  isolated offline next-decision comparisons, independent AI judging, and
+  automatic promotion of learned instruction supplements after held-out
+  non-regression and improvement checks. Trials never execute tools.
+- Tenant-scoped behavior policy inspection and reset endpoints, immutable
+  revision history, and promotion checks against concurrent agent/policy edits.
 - Stable, bounded `memory_list` pagination with tenant/namespace-bound cursors.
 - An explicit per-tenant memory-maintenance preset whose schedule is disabled
   by default and whose agent can access only the memory tool family.
@@ -33,7 +39,8 @@ not preserved unless a release note explicitly says otherwise.
   normalization repairs malformed multiline or serialized delivery objects
   before they can enter rolling context or reach a transport.
 - Delivery rows now capture an immutable payload at terminal commit time;
-  schema versions 6 and 7 migrate in place to schema version 8.
+  schema versions 6–8 migrate in place to schema version 9, which also adds
+  behavior-learning state separately from context, memory, and artifacts.
 - The example `simple-bot` keeps ten complete context turns and allows 180
   seconds for tool-heavy runs.
 

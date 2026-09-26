@@ -6,13 +6,14 @@ use crate::handlers::agents::{
     patch_tenant, put_agent,
 };
 use crate::handlers::artifact::{delete_artifact, list_artifacts, read_artifact, write_artifact};
+use crate::handlers::behavior::{clear_behavior_learning, get_behavior_learning};
 use crate::handlers::context::{delete_context, get_context, list_context_scopes};
 use crate::handlers::delivery_outbox::{ack_delivery, claim_deliveries, list_deliveries};
 use crate::handlers::mcp::{
     delete_mcp_server, get_mcp_server, list_mcp_servers, put_mcp_server, rediscover_enabled_servers,
 };
 use crate::handlers::memory::{get_memory_item, search_memory};
-use crate::handlers::presets::install_memory_maintenance;
+use crate::handlers::presets::{install_behavior_learning, install_memory_maintenance};
 use crate::handlers::runs::{cancel_run, get_run, get_run_trace, list_runs, wait_run};
 use crate::handlers::schedules::{delete_schedule, get_schedule, list_schedules, put_schedule};
 use crate::handlers::tools::list_tools;
@@ -181,6 +182,14 @@ pub(crate) fn build_router(app_state: AppState, api_token: Option<String>) -> Ro
         .route(
             "/v1/tenants/:tenant/presets/memory-maintenance",
             post(install_memory_maintenance),
+        )
+        .route(
+            "/v1/tenants/:tenant/presets/behavior-learning",
+            post(install_behavior_learning),
+        )
+        .route(
+            "/v1/tenants/:tenant/learning/:agent",
+            get(get_behavior_learning).delete(clear_behavior_learning),
         )
         .route("/v1/tenants/:tenant/agents", get(list_agents))
         .route(
@@ -470,6 +479,364 @@ mod tests {
         ] {
             assert!(!html.contains(write_surface), "found {write_surface}");
         }
+    }
+
+    #[tokio::test]
+    async fn behavior_learning_preset_is_tenant_scoped_restricted_and_disabled() {
+        let (_dir, app) = app().await;
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                "/v1/tenants/missing/presets/behavior-learning",
+                None,
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        request(
+            &app,
+            Method::POST,
+            "/v1/tenants",
+            Some(json!({"name":"demo"})),
+        )
+        .await;
+        let installed = request(
+            &app,
+            Method::POST,
+            "/v1/tenants/demo/presets/behavior-learning",
+            None,
+        )
+        .await;
+        assert_eq!(installed.0, StatusCode::CREATED);
+        assert_eq!(installed.1["agent_ref"], "system/behavior-learner");
+        assert_eq!(installed.1["schedule"], "system/behavior-learning");
+
+        let (_, agent) = request(
+            &app,
+            Method::GET,
+            "/v1/tenants/demo/agents/system%2Fbehavior-learner",
+            None,
+        )
+        .await;
+        assert_eq!(agent["allowed_families"], json!([]));
+        assert_eq!(agent["context_window"], 0);
+        assert_eq!(agent["model"], Value::Null);
+        assert_eq!(agent["timeout_ms"], 900_000);
+        assert_eq!(agent["max_steps"], 64);
+        let (_, schedules) = request(&app, Method::GET, "/v1/tenants/demo/schedules", None).await;
+        assert_eq!(schedules.as_array().unwrap().len(), 1);
+        assert_eq!(schedules[0]["spec"]["enabled"], false);
+        assert_eq!(schedules[0]["spec"]["delivery"], Value::Null);
+        assert_eq!(schedules[0]["spec"]["payload"]["target_agent"], "*");
+        assert_eq!(schedules[0]["next_trigger_at"], Value::Null);
+        assert_eq!(
+            request(&app, Method::GET, "/v1/tenants/demo/runs", None)
+                .await
+                .1,
+            json!([])
+        );
+    }
+
+    #[tokio::test]
+    async fn behavior_learning_preset_validates_options_and_preserves_custom_settings() {
+        let (_dir, app) = app().await;
+        request(
+            &app,
+            Method::POST,
+            "/v1/tenants",
+            Some(json!({"name":"demo"})),
+        )
+        .await;
+        request(
+            &app,
+            Method::PUT,
+            "/v1/tenants/demo/agents/bot",
+            Some(json!({"persona":"Help the user."})),
+        )
+        .await;
+        for (options, expected) in [
+            (json!({"target_agent":"missing"}), StatusCode::NOT_FOUND),
+            (
+                json!({"target_agent":"system/example"}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (json!({"judge_model":" "}), StatusCode::BAD_REQUEST),
+            (json!({"unexpected":true}), StatusCode::BAD_REQUEST),
+        ] {
+            assert_eq!(
+                request(
+                    &app,
+                    Method::POST,
+                    "/v1/tenants/demo/presets/behavior-learning",
+                    Some(options),
+                )
+                .await
+                .0,
+                expected
+            );
+        }
+        let options = json!({
+            "target_agent":"bot", "proposer_model":"deepseek-chat", "judge_model":"judge/chat",
+            "min_samples":8, "max_samples":10, "max_model_calls":64, "max_tokens":1024,
+            "min_improvement":0.2, "rubric":"Prefer valid tool arguments and grounded answers."
+        });
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                "/v1/tenants/demo/presets/behavior-learning",
+                Some(options.clone()),
+            )
+            .await
+            .0,
+            StatusCode::CREATED
+        );
+        let (_, schedules) = request(&app, Method::GET, "/v1/tenants/demo/schedules", None).await;
+        let mut schedule = schedules[0]["spec"].clone();
+        assert_eq!(schedule["payload"], options);
+        schedule["enabled"] = json!(true);
+        schedule["cron"] = json!("0 5 * * 1");
+        request(
+            &app,
+            Method::PUT,
+            "/v1/tenants/demo/schedules/system%2Fbehavior-learning",
+            Some(schedule.clone()),
+        )
+        .await;
+        request(
+            &app,
+            Method::PUT,
+            "/v1/tenants/demo/agents/system%2Fbehavior-learner",
+            Some(json!({"allowed_families":[],"context_window":3,"model":"custom/chat","timeout_ms":800_000})),
+        )
+        .await;
+        let reapplied = request(
+            &app,
+            Method::POST,
+            "/v1/tenants/demo/presets/behavior-learning",
+            None,
+        )
+        .await;
+        assert_eq!(reapplied.0, StatusCode::OK);
+        assert_eq!(reapplied.1["agent_created"], false);
+        assert_eq!(reapplied.1["agent_updated"], true);
+        assert_eq!(reapplied.1["schedule_created"], false);
+        let (_, schedules) = request(&app, Method::GET, "/v1/tenants/demo/schedules", None).await;
+        assert_eq!(schedules[0]["spec"], schedule);
+        let (_, agent) = request(
+            &app,
+            Method::GET,
+            "/v1/tenants/demo/agents/system%2Fbehavior-learner",
+            None,
+        )
+        .await;
+        assert_eq!(agent["context_window"], 0);
+        assert_eq!(agent["model"], "custom/chat");
+        assert_eq!(agent["timeout_ms"], 800_000);
+    }
+
+    #[tokio::test]
+    async fn behavior_learning_preset_rejects_incompatible_reserved_resources() {
+        let (_dir, app) = app().await;
+        request(
+            &app,
+            Method::POST,
+            "/v1/tenants",
+            Some(json!({"name":"demo"})),
+        )
+        .await;
+        request(
+            &app,
+            Method::PUT,
+            "/v1/tenants/demo/agents/system%2Fbehavior-learner",
+            Some(json!({"allowed_families":["memory"]})),
+        )
+        .await;
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                "/v1/tenants/demo/presets/behavior-learning",
+                None
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            request(&app, Method::GET, "/v1/tenants/demo/schedules", None)
+                .await
+                .1,
+            json!([])
+        );
+        request(
+            &app,
+            Method::DELETE,
+            "/v1/tenants/demo/agents/system%2Fbehavior-learner",
+            None,
+        )
+        .await;
+        request(
+            &app,
+            Method::PUT,
+            "/v1/tenants/demo/agents/bot",
+            Some(json!({})),
+        )
+        .await;
+        request(
+            &app,
+            Method::PUT,
+            "/v1/tenants/demo/schedules/system%2Fbehavior-learning",
+            Some(json!({"agent_ref":"bot","scope":"other","payload":{},"enabled":false,"cron":"0 4 * * 0","timezone":"UTC"})),
+        )
+        .await;
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                "/v1/tenants/demo/presets/behavior-learning",
+                None
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            request(
+                &app,
+                Method::GET,
+                "/v1/tenants/demo/agents/system%2Fbehavior-learner",
+                None
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn behavior_learning_state_is_tenant_scoped_and_clear_is_idempotent() {
+        let (dir, app) = app().await;
+        request(
+            &app,
+            Method::POST,
+            "/v1/tenants",
+            Some(json!({"name":"demo"})),
+        )
+        .await;
+        request(
+            &app,
+            Method::POST,
+            "/v1/tenants",
+            Some(json!({"name":"other"})),
+        )
+        .await;
+        request(
+            &app,
+            Method::PUT,
+            "/v1/tenants/demo/agents/bot",
+            Some(json!({})),
+        )
+        .await;
+        let state = request(&app, Method::GET, "/v1/tenants/demo/learning/bot", None).await;
+        assert_eq!(state.0, StatusCode::OK);
+        assert_eq!(
+            state.1,
+            json!({"tenant":"demo","agent":"bot","active_revision":null,"history":[]})
+        );
+        for uri in [
+            "/v1/tenants/other/learning/bot",
+            "/v1/tenants/missing/learning/bot",
+            "/v1/tenants/demo/learning/missing",
+        ] {
+            for method in [Method::GET, Method::DELETE] {
+                assert_eq!(
+                    request(&app, method, uri, None).await.0,
+                    StatusCode::NOT_FOUND
+                );
+            }
+        }
+        for _ in 0..2 {
+            let cleared =
+                request(&app, Method::DELETE, "/v1/tenants/demo/learning/bot", None).await;
+            assert_eq!(cleared.0, StatusCode::OK);
+            assert_eq!(cleared.1["cleared"], false);
+        }
+        assert_eq!(
+            request(&app, Method::GET, "/v1/tenants/demo/agents/bot", None)
+                .await
+                .0,
+            StatusCode::OK
+        );
+
+        request(
+            &app,
+            Method::POST,
+            "/v1/tenants/demo/presets/behavior-learning",
+            None,
+        )
+        .await;
+        let store = AgentdStore::new(dir.path().join("agentd.db").to_str().unwrap())
+            .await
+            .unwrap();
+        request(
+            &app,
+            Method::POST,
+            "/v1/tenants/demo/turns",
+            Some(json!({"agent":"bot","scope":"chat","payload":{"text":"hello"}})),
+        )
+        .await;
+        let source = store.claim_next_run().await.unwrap().unwrap();
+        store
+            .finalize_run_success(source.run.run_id, &json!({"reply":"hello"}), None)
+            .await
+            .unwrap();
+        let source = store.get_run(source.run.run_id).await.unwrap().unwrap();
+        request(
+            &app,
+            Method::POST,
+            "/v1/tenants/demo/turns",
+            Some(json!({"agent":"system/behavior-learner","scope":"behavior-learning/bot","payload":{"target_agent":"bot"}})),
+        )
+        .await;
+        let cycle = store.claim_next_run().await.unwrap().unwrap();
+        let target = store.get_agent("demo", "bot").await.unwrap().unwrap();
+        store
+            .finish_behavior_learning(
+                cycle.run.run_id,
+                agentd_store::BehaviorLearningResult {
+                    target_agent: "bot",
+                    expected_spec: &target.spec,
+                    expected_revision: None,
+                    instructions: "Check tool arguments before calling.",
+                    report: &json!({"mean_gain":0.2}),
+                    promote: true,
+                    source_updated_at: source.updated_at,
+                    source_run_id: source.run_id,
+                },
+            )
+            .await
+            .unwrap();
+        let (_, learned) = request(&app, Method::GET, "/v1/tenants/demo/learning/bot", None).await;
+        assert_eq!(learned["active_revision"]["revision"], 1);
+        assert_eq!(learned["history"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            request(&app, Method::DELETE, "/v1/tenants/demo/learning/bot", None)
+                .await
+                .1["cleared"],
+            true
+        );
+        let (_, cleared) = request(&app, Method::GET, "/v1/tenants/demo/learning/bot", None).await;
+        assert_eq!(cleared["active_revision"], Value::Null);
+        assert_eq!(cleared["history"], learned["history"]);
+        assert_eq!(
+            request(&app, Method::DELETE, "/v1/tenants/demo/learning/bot", None)
+                .await
+                .1["cleared"],
+            false
+        );
     }
 
     #[tokio::test]

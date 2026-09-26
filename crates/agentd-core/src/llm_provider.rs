@@ -70,6 +70,7 @@ impl CapabilityEngine {
             "tools",
             "tool_choice",
             "parallel_tool_calls",
+            "response_format",
         ] {
             if let Some(value) = params.get(field) {
                 body[field] = value.clone();

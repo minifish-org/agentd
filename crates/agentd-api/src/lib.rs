@@ -9,8 +9,10 @@ use uuid::Uuid;
 
 mod builtin_catalog;
 mod delivery;
+mod learning;
 pub use builtin_catalog::{builtin_tool_catalog, visible_tools};
 pub use delivery::*;
+pub use learning::*;
 
 pub const MEMORY_MAINTAINER_AGENT: &str = "system/memory-maintainer";
 pub const MEMORY_MAINTENANCE_SCHEDULE: &str = "system/memory-maintenance";
