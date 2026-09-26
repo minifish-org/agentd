@@ -54,8 +54,8 @@ in cross-run conversation history.
 
 ## Persistence
 
-The schema is versioned. Startup creates v9 for an empty database and migrates
-versions 6–8 in place; unknown versions request `--reset-data`.
+The schema is versioned. Startup creates v10 for an empty database and migrates
+versions 6–9 in place; unknown versions request `--reset-data`.
 
 Important facts are stored once. Runs own activation, final output, and an
 optional requested destination; `run_log` owns model/tool/output/status/error
@@ -84,19 +84,33 @@ by tenant and namespace, prevents cycles, and clamps traversal to 1–3 hops and
 separately selected tools. There is no automatic entity-extraction model,
 automatic recall, or automatic write.
 
-Enumeration uses bounded keyset pages over one tenant and namespace. The
-optional memory maintainer is an ordinary tenant agent plus an ordinary
-disabled-by-default schedule: due work enters the same queued run, claim,
-native tool loop, and `run_log` path as interactive work. One due schedule
-dispatches a separate run for each populated tenant memory namespace except the
-maintainer's own; its rolling context is disabled. There is no background
-agent type, heartbeat, cross-tenant maintainer, or host-side consolidation
-primitive.
+Enumeration uses bounded keyset pages over one tenant and namespace. Tenant
+creation automatically provisions memory-maintenance and behavior-learning
+resources with enabled schedules; startup fills missing resources for existing
+tenants. Compatible custom settings and explicit disabled schedules survive
+both paths. The memory maintainer is an ordinary tenant agent whose eligible
+work enters the queued run, claim, native tool loop, and `run_log` path.
+
+A memory namespace becomes eligible when it has at least `min_entries` entries
+(five by default) and an external content revision newer than its successful
+checkpoint. Insertions, changes to canonical text, and deletions advance that
+revision; identical text, graph-only changes, and the prepared maintainer's own
+writes do not. The scheduler suppresses ineligible or already-pending work.
+Before model execution the runtime repeats the check and captures a starting
+revision. Success consumes only that revision atomically with finalization, so
+concurrent external writes remain pending. Failure or cancellation consumes
+nothing. Each eligible namespace gets a separate scope; the maintainer's own
+namespace is excluded, and its rolling context is disabled.
 
 ## Behavior learning
 
-The optional behavior-learning preset schedules a reserved coordinator for each
-foreground agent in a tenant. Its host-controlled loop uses independent
+Behavior learning considers each foreground agent in a tenant. A database
+precheck requires new terminal source runs from the current agent lifecycle
+(eight by default), two distinct scopes, and no pending cycle for the same
+target. It reads bounded source metadata without model calls; the runtime then
+checks trace usability, allowed schemas, independent scopes, and budget. Failed
+prechecks advance the schedule without creating a run; queued or manual runs
+can still finish with `skipped`. Its host-controlled loop uses independent
 model contexts to propose an instruction supplement, produce baseline
 and candidate next decisions from frozen historical request prefixes, and judge
 each pair in both presentation orders. Tool schemas and existing observations

@@ -119,34 +119,57 @@ limit is clamped to `1..=100`; `next_cursor=null` marks completion. Cursors are
 opaque and bound to the current run's tenant and requested namespace. List
 items contain ID, text, and timestamps, never embeddings or database row IDs.
 
-`POST .../presets/memory-maintenance` idempotently creates the reserved
-memory-only maintainer agent, pinned to `standard/chat`, and its weekly schedule.
-The schedule is disabled and has no delivery by default. When enabled, it
-dispatches one run for each populated tenant memory namespace other than the
-maintainer's own namespace. The namespace list is read at trigger time; empty
-namespaces cause no run. For a fan-out trigger, `last_run_id` identifies the last
-queued run; use the runs list to see all namespace runs. Reapplying the preset
-repairs the reserved agent's model
-and upgrades an otherwise unmodified legacy `default`-only schedule to this
-behavior while preserving its enabled state. Other compatible schedule changes,
-including an operator's namespace payload and cron changes, are preserved;
-incompatible resources using the reserved names produce `409 Conflict`.
+Tenant creation automatically provisions both background agents and their
+weekly schedules; server startup fills missing resources for existing tenants.
+New schedules are enabled and have no delivery destination. Existing compatible
+settings, including an explicit `enabled=false`, are preserved. Preset POSTs
+remain idempotent repair endpoints; schedule PUT changes installed settings or
+pauses work. Incompatible resources using reserved names produce `409 Conflict`.
+
+`POST .../presets/memory-maintenance` ensures the memory-only maintainer agent,
+pinned to `standard/chat`, and its schedule. Its payload defaults to
+`namespace="*"` and `min_entries=5`; `min_entries` accepts integers from 2 to
+10000. At trigger time, a namespace must have enough entries and an unconsumed
+external content change to enter the queue. Changes mean insertions, changed
+canonical text, or deletions; identical text and graph-only changes do not
+qualify. The maintainer's own writes do not mark its namespace dirty. Its own
+namespace is excluded from wildcard discovery, and a queued/running pass for
+the same namespace prevents another scheduled run.
+
+Ineligible work causes no run or model call, but the schedule advances normally.
+For a fan-out trigger, `last_run_id` identifies the last queued run; use the runs
+list to see all namespace runs. A trigger that queues nothing preserves the
+previous `last_run_id`. Reapplying the preset repairs the reserved agent's model
+and upgrades an otherwise unmodified legacy `default`-only schedule while
+preserving its enabled state and compatible operator settings.
 
 For `system/memory-maintainer` runs, the native loop binds all memory calls to
 the input namespace (including the wrapped input of scheduled runs), requires an
 initial cursor-free `memory_list`, and requires
-every returned `next_cursor` to be followed until null. `memory_put` and
-`memory_delete` are rejected until enumeration completes, and a premature final
-response fails the run instead of accepting an unverified maintenance report.
+every returned `next_cursor` to be followed until null. Before model execution
+it rechecks the entry/change thresholds and records the starting external
+revision. An ineligible queued or manual run completes with `skipped` and no
+model call. `memory_put` and `memory_delete` are rejected until enumeration
+completes, and a premature final response fails the run. Successful finalization
+consumes only the starting revision, preserving concurrent external changes for
+a later pass. Failed or cancelled runs consume no revision.
 
 `POST .../presets/behavior-learning` accepts an optional JSON object of
-`BehaviorLearningOptions`; an empty body uses defaults. It creates a tool-free,
-context-free `system/behavior-learner` and a disabled weekly
-`system/behavior-learning` schedule with no delivery. `target_agent="*"`
-expands at schedule time into separate foreground-agent runs. A concrete target
+`BehaviorLearningOptions`; an empty body uses defaults when creating a missing
+schedule. It ensures the automatically provisioned tool-free, context-free
+`system/behavior-learner` and enabled weekly `system/behavior-learning` schedule.
+`target_agent="*"` considers foreground agents at schedule time. A concrete target
 must exist in that tenant and must not be a system agent. Compatible existing
 schedule settings are preserved on reapply; the learner's context window is
 repaired to zero. Reserved-name conflicts return `409`.
+
+Before queueing, the scheduler checks for `min_samples` new terminal source runs
+(default eight), at least two scopes, and no queued/running learning cycle for
+the same target. Sources must belong to the current agent lifecycle and be
+newer than the consumed cursor. Failed prechecks create no run or model call.
+They are necessary conditions only: the runtime still checks usable traces,
+tool schemas, independent scopes, and the complete evaluation budget. An
+ineligible queued or manual run reports `skipped` before any model call.
 
 `GET .../learning/:agent` returns the active learned revision and a bounded
 20-entry revision history. `DELETE` clears the active supplement while retaining

@@ -8,26 +8,42 @@ not preserved unless a release note explicitly says otherwise.
 
 ### Fixed
 
+- Native libsql connections now close their handle only once, through a
+  pinned local patch; concurrent connection teardown no longer repeats the
+  close on a potentially reused pointer.
+
 - `calc_eval` now reads the advertised `expression` argument, so valid native
   tool calls execute without retrying contradictory `expr`/`expression` errors.
   Its result payload keeps the existing `expr` and `result` fields.
 
 ### Added
 
-- An optional per-tenant behavior-learning preset with a disabled schedule,
+- Per-tenant behavior learning with an enabled weekly schedule,
   isolated offline next-decision comparisons, independent AI judging, and
   automatic promotion of learned instruction supplements after held-out
   non-regression and improvement checks. Trials never execute tools.
 - Tenant-scoped behavior policy inspection and reset endpoints, immutable
   revision history, and promotion checks against concurrent agent/policy edits.
 - Stable, bounded `memory_list` pagination with tenant/namespace-bound cursors.
-- An explicit per-tenant memory-maintenance preset whose schedule is disabled
-  by default and whose agent can access only the memory tool family.
+- Per-tenant memory maintenance whose agent can access only the memory tool
+  family, with an enabled weekly schedule and an entry/change threshold.
 - Failure deliveries for explicitly addressed runs, including a stable
   machine-readable timeout/failure code and a retry-safe user-facing reply.
 
 ### Changed
 
+- New tenants automatically receive both background agents and schedules;
+  startup fills missing resources for existing tenants. Compatible settings,
+  including an explicit `enabled=false`, are preserved.
+- Memory maintenance requires at least five entries by default and an
+  unconsumed external text insertion, update, or deletion. Its own changes do
+  not retrigger maintenance; successful runs consume their starting revision
+  while preserving concurrent external changes. A failed maintenance write
+  stops the run without consuming its checkpoint.
+- Background schedules check eligibility before queueing. Behavior learning
+  requires eight new source runs across two scopes by default, and both tasks
+  suppress duplicate pending work for the same target. Ineligible scheduled
+  work creates no run or model call; runtime gates remain for queued/manual runs.
 - Memory retrieval now uses INT8 multilingual E5 Small embeddings, fuses BM25
   and semantic candidates with RRF to top 10, then applies an INT8 BGE
   reranker-v2-m3 cross-encoder and returns at most the top 5. The database
@@ -39,8 +55,8 @@ not preserved unless a release note explicitly says otherwise.
   normalization repairs malformed multiline or serialized delivery objects
   before they can enter rolling context or reach a transport.
 - Delivery rows now capture an immutable payload at terminal commit time;
-  schema versions 6–8 migrate in place to schema version 9, which also adds
-  behavior-learning state separately from context, memory, and artifacts.
+  schema versions 6–9 migrate in place to schema version 10, which also adds
+  behavior-learning state and memory-maintenance revision checkpoints.
 - The example `simple-bot` keeps ten complete context turns and allows 180
   seconds for tool-heavy runs.
 

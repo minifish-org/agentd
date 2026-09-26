@@ -1,5 +1,5 @@
 use super::*;
-use agentd_api::{AgentSpec, BehaviorRevision};
+use agentd_api::{AgentSpec, BehaviorLearningOptions, BehaviorRevision};
 
 pub(super) const SCHEMA_STATEMENTS: [&str; 3] = [
     "CREATE TABLE IF NOT EXISTS behavior_heads (
@@ -30,6 +30,16 @@ pub(super) const SCHEMA_STATEMENTS: [&str; 3] = [
 pub struct BehaviorSnapshot {
     pub agent: Agent,
     pub active_revision: Option<BehaviorRevision>,
+}
+
+/// Cheap scheduling eligibility, before the runtime validates captured traces.
+/// Counts describe terminal source rows, not necessarily usable model requests.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BehaviorLearningReadiness {
+    pub ready: bool,
+    pub reason: &'static str,
+    pub source_runs: usize,
+    pub independent_scopes: usize,
 }
 
 pub struct BehaviorLearningResult<'a> {
@@ -95,6 +105,84 @@ pub(super) async fn active_revision_for_spec(
 }
 
 impl AgentdStore {
+    /// Inspect a concrete target without reading model traces or calling an LLM.
+    /// This is a necessary scheduling gate, not a reservation or an assertion
+    /// that the selected traces satisfy the runtime's schema and budget checks.
+    pub async fn behavior_learning_readiness(
+        &self,
+        tenant: &str,
+        options: &BehaviorLearningOptions,
+    ) -> Result<BehaviorLearningReadiness> {
+        options.validate().map_err(|error| anyhow!(error))?;
+        if options.target_agent == "*" {
+            return Err(anyhow!(
+                "behavior readiness requires a concrete target_agent"
+            ));
+        }
+        let mut readiness = BehaviorLearningReadiness {
+            ready: false,
+            reason: "target_not_found",
+            source_runs: 0,
+            independent_scopes: 0,
+        };
+        let Some(agent) = self.get_agent(tenant, &options.target_agent).await? else {
+            return Ok(readiness);
+        };
+        if !is_foreground_agent(&agent) {
+            readiness.reason = "system_target";
+            return Ok(readiness);
+        }
+        // Every learner submission canonicalizes this scope from target_agent.
+        // A pending run in another tenant or for another target is independent.
+        let pending = db::query_scalar::<i64>(
+            "SELECT EXISTS(SELECT 1 FROM runs WHERE tenant = ? AND agent_ref = ?
+             AND scope = ? AND status IN ('queued', 'running'))",
+        )
+        .bind(tenant)
+        .bind(BEHAVIOR_LEARNER_AGENT)
+        .bind(format!("behavior-learning/{}", options.target_agent))
+        .fetch_optional(&self.pool)
+        .await?
+        .unwrap_or(0);
+        if pending != 0 {
+            readiness.reason = "already_pending";
+            return Ok(readiness);
+        }
+        // Match list_behavior_source_runs and the core's bounded source scan,
+        // projecting only scope to avoid loading potentially large run inputs.
+        let rows = db::query(
+            "SELECT r.scope FROM runs r
+             JOIN agents a ON a.tenant = r.tenant AND a.name = r.agent_ref
+             LEFT JOIN behavior_heads h ON h.tenant = r.tenant AND h.agent_ref = r.agent_ref
+             WHERE r.tenant = ? AND r.agent_ref = ? AND r.status IN ('succeeded', 'failed')
+               AND r.created_at >= a.created_at
+               AND COALESCE(json_extract(a.metadata_json, '$.labels.\"agentd.system\"'), '') != 'true'
+               AND (h.source_updated_at IS NULL OR r.updated_at > h.source_updated_at
+                    OR (r.updated_at = h.source_updated_at AND r.run_id > h.source_run_id))
+             ORDER BY r.updated_at DESC, r.run_id DESC LIMIT ?",
+        )
+        .bind(tenant)
+        .bind(&options.target_agent)
+        .bind(options.max_samples.saturating_mul(4).min(256) as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        let scopes = rows
+            .iter()
+            .map(|row| row.try_get::<String, _>("scope"))
+            .collect::<std::result::Result<BTreeSet<_>, _>>()?;
+        readiness.source_runs = rows.len();
+        readiness.independent_scopes = scopes.len();
+        readiness.reason = if readiness.source_runs < options.min_samples {
+            "insufficient_samples"
+        } else if readiness.independent_scopes < 2 {
+            "insufficient_independent_scopes"
+        } else {
+            readiness.ready = true;
+            "ready"
+        };
+        Ok(readiness)
+    }
+
     pub(super) async fn ensure_foreground_behavior_target(
         &self,
         tenant: &str,
@@ -350,12 +438,25 @@ mod tests {
     }
 
     async fn source(store: &AgentdStore, tenant: &str) -> AgentRun {
+        source_with_scope(store, tenant, "chat").await
+    }
+
+    async fn source_with_scope(store: &AgentdStore, tenant: &str, scope: &str) -> AgentRun {
+        source_for_agent(store, tenant, "bot", scope).await
+    }
+
+    async fn source_for_agent(
+        store: &AgentdStore,
+        tenant: &str,
+        agent_ref: &str,
+        scope: &str,
+    ) -> AgentRun {
         let id = store
             .submit_run(NewRun {
                 tenant,
                 name: "source",
-                agent_ref: "bot",
-                scope: "chat",
+                agent_ref,
+                scope,
                 source: "test",
                 input: &json!({"text":"compute 2+2"}),
                 request_id: None,
@@ -420,6 +521,236 @@ mod tests {
                 },
             )
             .await
+    }
+
+    fn readiness_options() -> BehaviorLearningOptions {
+        BehaviorLearningOptions {
+            target_agent: "bot".into(),
+            min_samples: 4,
+            max_samples: 4,
+            ..BehaviorLearningOptions::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn behavior_readiness_requires_new_samples_and_independent_scopes() {
+        let (_dir, store, _spec) = fixture().await;
+        let options = readiness_options();
+        let empty = store
+            .behavior_learning_readiness("one", &options)
+            .await
+            .unwrap();
+        assert!(!empty.ready);
+        assert_eq!(empty.reason, "insufficient_samples");
+        assert_eq!(empty.source_runs, 0);
+        for _ in 0..3 {
+            source(&store, "one").await;
+        }
+        let short = store
+            .behavior_learning_readiness("one", &options)
+            .await
+            .unwrap();
+        assert_eq!(short.reason, "insufficient_samples");
+        assert_eq!(short.source_runs, 3);
+        assert_eq!(short.independent_scopes, 1);
+        source(&store, "one").await;
+        let single_scope = store
+            .behavior_learning_readiness("one", &options)
+            .await
+            .unwrap();
+        assert_eq!(single_scope.reason, "insufficient_independent_scopes");
+        assert_eq!(single_scope.source_runs, 4);
+        source_with_scope(&store, "one", "independent").await;
+        let ready = store
+            .behavior_learning_readiness("one", &options)
+            .await
+            .unwrap();
+        assert!(ready.ready);
+        assert_eq!(ready.reason, "ready");
+        assert_eq!(ready.source_runs, 5);
+        assert_eq!(ready.independent_scopes, 2);
+        assert_eq!(
+            store
+                .behavior_learning_readiness("two", &options)
+                .await
+                .unwrap()
+                .source_runs,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn behavior_readiness_only_blocks_pending_cycles_for_the_same_tenant_and_target() {
+        let (_dir, store, spec) = fixture().await;
+        let options = readiness_options();
+        for index in 0..4 {
+            source_with_scope(&store, "one", &format!("chat/{index}")).await;
+        }
+        // A running cycle for another tenant must not occupy this target lane.
+        let other_tenant = cycle(&store, "two").await;
+        assert!(
+            store
+                .behavior_learning_readiness("one", &options)
+                .await
+                .unwrap()
+                .ready
+        );
+        store
+            .apply_agent(&AgentResource {
+                metadata: ResourceMeta {
+                    tenant: "one".into(),
+                    name: "other-bot".into(),
+                    labels: BTreeMap::new(),
+                },
+                spec,
+            })
+            .await
+            .unwrap();
+        let other_target = store
+            .submit_run(NewRun {
+                tenant: "one",
+                name: "other-target-cycle",
+                agent_ref: BEHAVIOR_LEARNER_AGENT,
+                scope: "ignored",
+                source: "api",
+                input: &json!({"target_agent":"other-bot"}),
+                request_id: None,
+                schedule_name: None,
+                delivery_destination: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            store
+                .behavior_learning_readiness("one", &options)
+                .await
+                .unwrap()
+                .ready
+        );
+        let same_target = store
+            .submit_run(NewRun {
+                tenant: "one",
+                name: "same-target-cycle",
+                agent_ref: BEHAVIOR_LEARNER_AGENT,
+                scope: "ignored",
+                source: "api",
+                input: &json!({"target_agent":"bot"}),
+                request_id: None,
+                schedule_name: None,
+                delivery_destination: None,
+            })
+            .await
+            .unwrap();
+        let queued = store
+            .behavior_learning_readiness("one", &options)
+            .await
+            .unwrap();
+        assert!(!queued.ready);
+        assert_eq!(queued.reason, "already_pending");
+        store
+            .cancel_run_request(other_target, "fixture complete")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.claim_next_run().await.unwrap().unwrap().run.run_id,
+            same_target
+        );
+        assert_eq!(
+            store
+                .behavior_learning_readiness("one", &options)
+                .await
+                .unwrap()
+                .reason,
+            "already_pending"
+        );
+        store
+            .fail_run(same_target, "fixture complete")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .behavior_learning_readiness("one", &options)
+                .await
+                .unwrap()
+                .ready
+        );
+        store
+            .fail_run(other_tenant, "fixture complete")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn behavior_readiness_excludes_consumed_and_previous_agent_lifecycle_sources() {
+        let (_dir, store, spec) = fixture().await;
+        let options = readiness_options();
+        for index in 0..4 {
+            source_with_scope(&store, "one", &format!("chat/{index}")).await;
+        }
+        let latest = store
+            .list_behavior_source_runs("one", "bot", 20)
+            .await
+            .unwrap()
+            .remove(0);
+        let coordinator = cycle(&store, "one").await;
+        finish(&store, coordinator, &spec, None, &latest, true)
+            .await
+            .unwrap();
+        let consumed = store
+            .behavior_learning_readiness("one", &options)
+            .await
+            .unwrap();
+        assert_eq!(consumed.reason, "insufficient_samples");
+        assert_eq!(consumed.source_runs, 0);
+        store.delete_agent("one", "bot").await.unwrap();
+        assert_eq!(
+            store
+                .behavior_learning_readiness("one", &options)
+                .await
+                .unwrap()
+                .reason,
+            "target_not_found"
+        );
+        let mut agent = AgentResource {
+            metadata: ResourceMeta {
+                tenant: "one".into(),
+                name: "bot".into(),
+                labels: BTreeMap::new(),
+            },
+            spec,
+        };
+        store.apply_agent(&agent).await.unwrap();
+        let recreated = store
+            .behavior_learning_readiness("one", &options)
+            .await
+            .unwrap();
+        assert_eq!(recreated.reason, "insufficient_samples");
+        assert_eq!(recreated.source_runs, 0);
+        agent
+            .metadata
+            .labels
+            .insert("agentd.system".into(), "true".into());
+        store.apply_agent(&agent).await.unwrap();
+        assert_eq!(
+            store
+                .behavior_learning_readiness("one", &options)
+                .await
+                .unwrap()
+                .reason,
+            "system_target"
+        );
+        assert_eq!(
+            store
+                .behavior_learning_readiness("missing", &options)
+                .await
+                .unwrap()
+                .reason,
+            "target_not_found"
+        );
+        assert!(store
+            .behavior_learning_readiness("one", &BehaviorLearningOptions::default())
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -902,6 +1233,11 @@ mod tests {
                 .await
                 .unwrap();
         }
+        for agent in ["bot", "other", "hidden", "system/helper"] {
+            for index in 0..4 {
+                source_for_agent(&store, "one", agent, &format!("chat/{}", index % 2)).await;
+            }
+        }
         let now = Utc::now();
         store
             .put_schedule(
@@ -910,7 +1246,7 @@ mod tests {
                 &ScheduleSpec {
                     agent_ref: BEHAVIOR_LEARNER_AGENT.into(),
                     scope: "behavior-learning/*".into(),
-                    payload: json!({"target_agent":"*"}),
+                    payload: json!({"target_agent":"*","min_samples":4,"max_samples":4}),
                     delivery: None,
                     at: Some(now + ChronoDuration::minutes(1)),
                     cron: None,
@@ -921,15 +1257,22 @@ mod tests {
             .await
             .unwrap();
         let mut all = Vec::new();
-        for _ in 0..2 {
+        for attempt in 0..2 {
             db::query("UPDATE schedules SET next_trigger_at = ? WHERE tenant = 'one'")
                 .bind((now - ChronoDuration::seconds(1)).to_rfc3339())
                 .execute(&store.pool)
                 .await
                 .unwrap();
-            all.extend(store.trigger_due_schedules(now, 10).await.unwrap());
+            let triggered = store.trigger_due_schedules(now, 10).await.unwrap();
+            if attempt == 1 {
+                assert!(
+                    triggered.is_empty(),
+                    "queued target cycles must not accumulate"
+                );
+            }
+            all.extend(triggered);
         }
-        assert_eq!(all.len(), 4);
+        assert_eq!(all.len(), 2);
         for id in all {
             let run = store.get_run(id).await.unwrap().unwrap();
             let target = run.input["input"]["target_agent"].as_str().unwrap();
@@ -977,9 +1320,9 @@ mod tests {
             scope: "caller-scope".into(),
             payload: json!({}),
             delivery: None,
-            at: Some(now + ChronoDuration::minutes(1)),
-            cron: None,
-            timezone: None,
+            at: None,
+            cron: Some("0 4 * * *".into()),
+            timezone: Some("UTC".into()),
             enabled: true,
         };
         for payload in [
@@ -1021,13 +1364,41 @@ mod tests {
         assert_eq!(stored.spec.payload["target_agent"], "*");
         assert_eq!(stored.spec.payload["min_samples"], 8);
         assert_eq!(stored.spec.scope, "behavior-learning/*");
+        schedule.payload = json!({"min_samples":4,"max_samples":4});
+        store
+            .put_schedule("one", BEHAVIOR_LEARNING_SCHEDULE, &schedule)
+            .await
+            .unwrap();
         db::query("UPDATE schedules SET next_trigger_at = ? WHERE tenant = 'one'")
             .bind((now - ChronoDuration::seconds(1)).to_rfc3339())
             .execute(&store.pool)
             .await
             .unwrap();
         let triggered = store.trigger_due_schedules(now, 10).await.unwrap();
-        assert_eq!(triggered.len(), 1);
+        assert!(
+            triggered.is_empty(),
+            "an empty tenant must not create a learning run"
+        );
+        let after_skip = store
+            .get_schedule("one", BEHAVIOR_LEARNING_SCHEDULE)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_skip.last_triggered_at, Some(now));
+        assert!(after_skip.next_trigger_at.unwrap() > now);
+        assert!(after_skip.last_run_id.is_none());
+        for index in 0..4 {
+            source_with_scope(&store, "one", &format!("chat/{}", index % 2)).await;
+        }
+        let triggered = store
+            .trigger_due_schedules(after_skip.next_trigger_at.unwrap(), 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            triggered.len(),
+            1,
+            "new independent source runs make the next tick eligible"
+        );
         assert_eq!(
             store.get_run(triggered[0]).await.unwrap().unwrap().input["input"]["target_agent"],
             "bot"
@@ -1076,7 +1447,7 @@ mod tests {
                 .fetch_optional(&migrated.pool)
                 .await
                 .unwrap(),
-            Some(9)
+            Some(10)
         );
         assert!(migrated
             .get_memory("one", "bot", "fact")

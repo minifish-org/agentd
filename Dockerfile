@@ -22,6 +22,7 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY .cargo ./.cargo
 COPY crates ./crates
+COPY vendor ./vendor
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/build \
     cargo build --locked --release -p agentd \
@@ -40,6 +41,7 @@ COPY --from=builder /tmp/agentd /usr/local/bin/agentd
 COPY --from=retrieval-models /models/multilingual-e5-small /opt/agentd/models/multilingual-e5-small
 COPY --from=retrieval-models /models/bge-reranker-v2-m3 /opt/agentd/models/bge-reranker-v2-m3
 COPY LICENSE THIRD_PARTY_NOTICES.md /usr/share/doc/agentd/
+COPY vendor/libsql/LICENSE.md /usr/share/doc/agentd/libsql.LICENSE
 ENV AGENTD_CONFIG=/etc/agentd/agentd.toml
 EXPOSE 8080
 USER agentd

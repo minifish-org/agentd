@@ -10,8 +10,8 @@ persistence, scheduling, per-scope serialization, raw traces, and one pull
 delivery outbox.
 
 Database and HTTP compatibility are intentionally narrow. Runtime data remains
-disposable, but schema versions 6–8 migrate in place to v9, preserving existing
-runtime data and adding behavior-learning state. Other schema mismatches
+disposable, but schema versions 6–9 migrate in place to v10, preserving existing
+runtime data and adding background-maintenance state. Other schema mismatches
 require `--reset-data`.
 
 ## Runtime shape
@@ -37,6 +37,7 @@ claim run → read context → native model/tool loop
 The database has tenants, agents, runs, run log, contexts, artifacts, memory,
 lightweight entities and edges, schedules, deliveries, MCP servers, and separate
 behavior-learning policies and revision history. Memory
+maintenance keeps separate namespace revision checkpoints. Memory
 keeps one FTS5 index and one 384-dimension embedding BLOB per fact. Exact cosine
 and lexical ranks are combined with RRF; its top 10 are reranked to a final top
 5. Explicit relationships use ordinary SQL joins and bounded recursive CTEs in
@@ -175,30 +176,35 @@ every semantic search, and no entity extractor or graph database is required.
 opaque cursor bound to the current run's tenant and namespace. It returns only
 IDs, text, and timestamps; use `memory_search` for relevance retrieval.
 
-Install the optional per-tenant maintenance resources explicitly with
-`POST /v1/tenants/:tenant/presets/memory-maintenance`. The preset creates a
-memory-only `system/memory-maintainer` agent pinned to `standard/chat` and a weekly
-`system/memory-maintenance` schedule. The schedule starts disabled and has no
-delivery destination, so installation alone produces no model calls or memory
-changes. Once enabled, each trigger creates a separate run for every populated
-memory namespace in that tenant, including agent-named namespaces and `default`,
-but excluding `system/memory-maintainer`. Namespaces are discovered when the
-schedule fires, so newly added agent memory is included automatically. The
-maintainer retains no rolling context between runs. Enable or customize the
-schedule through the normal schedule API. Maintainer runs cannot succeed or
-mutate memory until they complete `memory_list` pagination for their input
-namespace.
+New tenants automatically receive memory-maintenance and behavior-learning
+agents with enabled weekly schedules and no delivery destinations. Startup
+adds missing resources to existing tenants while preserving compatible custom
+settings, including an explicit `enabled=false`. The preset endpoints remain
+available for repairs; use the schedule API to pause or customize either task.
+Database prechecks keep unnecessary work out of the run queue and make no model
+calls.
 
-An optional `POST /v1/tenants/:tenant/presets/behavior-learning` preset installs
-a tool-free `system/behavior-learner` and a disabled weekly schedule. Once
-enabled, it automatically proposes instruction supplements for foreground
-agents, compares current and candidate next decisions on held-out historical
-inputs, and uses an independent model judge in both comparison orders. A
-candidate is promoted only when every evaluated case avoids regression and the
-mean gain meets the configured threshold. Trials execute no tools and retain no
+The memory-only `system/memory-maintainer` uses `standard/chat` and retains no
+rolling context. A namespace qualifies when it has at least five entries
+(`min_entries`) and an unconsumed external content change: an insertion, changed
+memory text, or deletion. Rewriting identical text, graph-only updates, and the
+maintainer's own edits do not trigger another pass. Successful maintenance
+consumes the revision captured at the start; concurrent external changes remain
+pending. Each eligible namespace, including agent-named namespaces and
+`default`, receives its own run, excluding the maintainer's own namespace.
+The runtime rechecks eligibility and requires complete `memory_list` pagination
+before mutations or a successful maintenance report.
+
+The tool-free `system/behavior-learner` waits for at least eight new terminal
+source runs across two conversation scopes and avoids duplicate queued/running
+cycles for the same target. After runtime checks of trace usability and budget,
+it proposes instruction supplements, compares current and candidate next
+decisions on held-out historical inputs, and uses an independent model judge in
+both comparison orders. Promotion requires no regression on any evaluated case
+and sufficient mean improvement. Trials execute no tools and retain no
 foreground context; learned instructions and history are separate from persona
-and business memory. This works through a standard chat API, including DeepSeek,
-and optimizes instructions rather than model weights. See
+and business memory. This uses a standard chat API, including DeepSeek, and
+optimizes instructions rather than model weights. See
 [behavior learning](docs/behavior-learning.md) for setup, budgets, inspection,
 reset, and the limits of offline decision evaluation.
 

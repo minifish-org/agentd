@@ -146,6 +146,7 @@ impl MemoryMaintenanceScan {
             .get("namespace")
             .or_else(|| input.pointer("/input/namespace"))
             .and_then(Value::as_str)
+            .map(str::trim)
             .filter(|namespace| !namespace.is_empty())
             .ok_or_else(|| anyhow!("memory maintainer input requires a non-empty namespace"))?;
         Ok(Self::Required {
@@ -274,6 +275,26 @@ impl RuntimeEngine {
             return self.run_behavior_learning(assigned, context).await;
         }
         let mut maintenance_scan = MemoryMaintenanceScan::for_run(&run.agent_ref, &run.input)?;
+        if run.agent_ref == MEMORY_MAINTAINER_AGENT {
+            let min_entries = agentd_store::memory_maintenance_min_entries(&run.input)?;
+            let gate = self
+                .store
+                .prepare_memory_maintenance(run.run_id, min_entries)
+                .await?;
+            self.store
+                .append_event(run.run_id, "maintenance_check", json!(gate), Utc::now())
+                .await?;
+            if !gate.ready {
+                return self
+                    .store
+                    .finalize_run_success(
+                        run.run_id,
+                        &json!({"status":"skipped","reason":gate.reason,"details":gate}),
+                        None,
+                    )
+                    .await;
+            }
+        }
         let prior_state = self
             .store
             .get_context_state(&run.tenant, &run.agent_ref, &run.scope)
@@ -438,6 +459,20 @@ impl RuntimeEngine {
                         Utc::now(),
                     )
                     .await?;
+                if run.agent_ref == MEMORY_MAINTAINER_AGENT
+                    && matches!(name.as_str(), "memory_put" | "memory_delete")
+                    && !envelope.ok
+                {
+                    // A final model answer cannot turn an incomplete cleanup
+                    // into a successful checkpoint. Persist the failure now;
+                    // fail_run preserves an already cancelled terminal state.
+                    let error = format!(
+                        "memory maintenance {name} failed: {}",
+                        envelope.error.as_deref().unwrap_or("unknown tool error")
+                    );
+                    self.store.fail_run(run.run_id, &error).await?;
+                    return Err(anyhow!(error));
+                }
                 maintenance_scan.observe_list_result(&name, &envelope)?;
                 if let Some(notice) = loop_guard.observe(&name, &arguments, &envelope, &call_id) {
                     loop_notices.push(notice);
@@ -752,6 +787,7 @@ mod tests {
         MAX_WEB_TOOL_CALLS_PER_RUN,
     };
     use crate::{CapabilityEngine, CapabilityEngineConfig, ToolResult};
+    use agentd_api::MEMORY_MAINTAINER_AGENT;
     use agentd_api::{AgentLimits, AgentResource, AgentSpec, ResourceMeta, ToolFamily, ToolSpec};
     use agentd_store::{AgentdStore, NewRun};
     use axum::{routing::post, Json, Router};
@@ -1308,6 +1344,20 @@ mod tests {
             },
         );
         let input = json!({"activation":"schedule","input":{"namespace":"profile"}});
+        let mut embedding = vec![0.0; agentd_store::MEMORY_EMBEDDING_DIM];
+        embedding[0] = 1.0;
+        for index in 0..5 {
+            store
+                .put_memory(
+                    "demo",
+                    "profile",
+                    &format!("fact-{index}"),
+                    "existing fact",
+                    &embedding,
+                )
+                .await
+                .unwrap();
+        }
         let run_id = store
             .submit_run(NewRun {
                 tenant: "demo",
@@ -1339,8 +1389,304 @@ mod tests {
             .await
             .unwrap()
             .iter()
-            .all(|event| event.kind == "model"));
+            .all(|event| ["maintenance_check", "model"].contains(&event.kind.as_str())));
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn memory_maintenance_small_and_unchanged_namespaces_skip_without_model_calls() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = AgentdStore::new(directory.path().join("agentd.db").to_str().unwrap())
+            .await
+            .unwrap();
+        store.create_tenant("demo", &json!({})).await.unwrap();
+        store
+            .apply_agent(&AgentResource {
+                metadata: ResourceMeta {
+                    name: MEMORY_MAINTAINER_AGENT.into(),
+                    tenant: "demo".into(),
+                    labels: BTreeMap::new(),
+                },
+                spec: AgentSpec {
+                    allowed_families: Some(vec![ToolFamily::Memory]),
+                    limits: AgentLimits {
+                        timeout_ms: 5000,
+                        max_steps: 4,
+                    },
+                    system_prompt: None,
+                    model: None,
+                    temperature: None,
+                    max_tokens: None,
+                    context_window: Some(0),
+                },
+            })
+            .await
+            .unwrap();
+        let mut embedding = vec![0.0; agentd_store::MEMORY_EMBEDDING_DIM];
+        embedding[0] = 1.0;
+        for (namespace, count) in [("small", 1), ("done", 5)] {
+            for index in 0..count {
+                store
+                    .put_memory(
+                        "demo",
+                        namespace,
+                        &format!("fact-{index}"),
+                        "existing fact",
+                        &embedding,
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        // No provider is configured: reaching any model call fails this test.
+        let runtime = RuntimeEngine::new(CapabilityEngine::new(store.clone()), store.clone());
+        for (namespace, reason) in [
+            ("done", None),
+            ("empty", Some("too_few_entries")),
+            ("small", Some("too_few_entries")),
+            ("done", Some("unchanged")),
+        ] {
+            let run_id = store
+                .submit_run(NewRun {
+                    tenant: "demo",
+                    name: "maintenance",
+                    agent_ref: MEMORY_MAINTAINER_AGENT,
+                    scope: "caller-scope",
+                    source: "schedule",
+                    input: &json!({"activation":"schedule","input":{"namespace":namespace}}),
+                    request_id: None,
+                    schedule_name: None,
+                    delivery_destination: None,
+                })
+                .await
+                .unwrap();
+            let assigned = store.claim_next_run().await.unwrap().unwrap();
+            assert_eq!(assigned.run.run_id, run_id);
+            assert_eq!(
+                assigned.run.scope,
+                format!("memory-maintenance/{namespace}")
+            );
+            if let Some(reason) = reason {
+                let report = runtime.execute_assigned_run(&assigned).await.unwrap();
+                assert!(report.error.is_none(), "{:?}", report.error);
+                let output = store.get_run_output(run_id).await.unwrap().unwrap();
+                assert_eq!(output["status"], "skipped");
+                assert_eq!(output["reason"], reason);
+                assert!(store
+                    .list_run_log(run_id)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|event| event.kind != "model" && event.kind != "tool"));
+            } else {
+                assert!(
+                    store
+                        .prepare_memory_maintenance(run_id, 5)
+                        .await
+                        .unwrap()
+                        .ready
+                );
+                store
+                    .finalize_run_success(run_id, &json!({"scanned":5}), None)
+                    .await
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            store
+                .list_memory_page("demo", "done", None, 100)
+                .await
+                .unwrap()
+                .items
+                .len(),
+            5
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_maintenance_mutations_cannot_consume_checkpoint_or_override_cancellation() {
+        use axum::extract::State;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        #[derive(Clone)]
+        struct MockState {
+            mutation: &'static str,
+            cancel_before_mutation: bool,
+            calls: Arc<AtomicUsize>,
+            store: AgentdStore,
+            run_id: uuid::Uuid,
+        }
+
+        async fn completion(
+            State(state): State<MockState>,
+            Json(body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            state.calls.fetch_add(1, Ordering::SeqCst);
+            let tool_results = body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|message| message["role"] == "tool")
+                .count();
+            if tool_results >= 2 {
+                // Before the fix the model could declare success here after a
+                // failed mutation, permanently consuming this dirty revision.
+                return Json(json!({"choices":[{"message":{
+                    "role":"assistant","content":"{\"done\":true}"
+                }}]}));
+            }
+            if tool_results == 1 && state.cancel_before_mutation {
+                state
+                    .store
+                    .cancel_run_request(state.run_id, "cancel during cleanup")
+                    .await
+                    .unwrap();
+            }
+            let tool = if tool_results == 0 {
+                "memory_list"
+            } else {
+                state.mutation
+            };
+            // Listing succeeds; put lacks text and delete lacks id, yielding a
+            // deterministic mutation error without embedding/model downloads.
+            Json(json!({"choices":[{"message":{
+                "role":"assistant","content":null,
+                "tool_calls":[{
+                    "id":format!("call-{tool_results}"),"type":"function",
+                    "function":{"name":tool,"arguments":"{\"namespace\":\"profile\"}"}
+                }]
+            }}]}))
+        }
+
+        for (mutation, cancel_before_mutation) in [
+            ("memory_put", false),
+            ("memory_delete", false),
+            ("memory_delete", true),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = AgentdStore::new(directory.path().join("agentd.db").to_str().unwrap())
+                .await
+                .unwrap();
+            store.create_tenant("demo", &json!({})).await.unwrap();
+            store
+                .apply_agent(&AgentResource {
+                    metadata: ResourceMeta {
+                        name: MEMORY_MAINTAINER_AGENT.into(),
+                        tenant: "demo".into(),
+                        labels: BTreeMap::new(),
+                    },
+                    spec: AgentSpec {
+                        allowed_families: Some(vec![ToolFamily::Memory]),
+                        limits: AgentLimits {
+                            timeout_ms: 5000,
+                            max_steps: 4,
+                        },
+                        system_prompt: None,
+                        model: None,
+                        temperature: None,
+                        max_tokens: None,
+                        context_window: Some(0),
+                    },
+                })
+                .await
+                .unwrap();
+            let mut embedding = vec![0.; agentd_store::MEMORY_EMBEDDING_DIM];
+            embedding[0] = 1.;
+            for index in 0..5 {
+                store
+                    .put_memory(
+                        "demo",
+                        "profile",
+                        &format!("fact-{index}"),
+                        "existing fact",
+                        &embedding,
+                    )
+                    .await
+                    .unwrap();
+            }
+            let run_id = store
+                .submit_run(NewRun {
+                    tenant: "demo",
+                    name: "maintenance",
+                    agent_ref: MEMORY_MAINTAINER_AGENT,
+                    scope: "memory-maintenance/profile",
+                    source: "test",
+                    input: &json!({"namespace":"profile"}),
+                    request_id: None,
+                    schedule_name: None,
+                    delivery_destination: None,
+                })
+                .await
+                .unwrap();
+            let assigned = store.claim_next_run().await.unwrap().unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mock = MockState {
+                mutation,
+                cancel_before_mutation,
+                calls: calls.clone(),
+                store: store.clone(),
+                run_id,
+            };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    Router::new()
+                        .route("/v1/chat/completions", post(completion))
+                        .with_state(mock),
+                )
+                .await
+                .unwrap();
+            });
+            let caps = CapabilityEngine::new_with_config(
+                store.clone(),
+                CapabilityEngineConfig {
+                    llm_api_base: Some(format!("http://{address}/v1")),
+                    llm_api_key: None,
+                    llm_model: Some("test".into()),
+                    ..CapabilityEngineConfig::default()
+                },
+            );
+            let report = RuntimeEngine::new(caps, store.clone())
+                .execute_assigned_run(&assigned)
+                .await
+                .unwrap();
+            assert!(report
+                .error
+                .as_deref()
+                .unwrap()
+                .contains(&format!("memory maintenance {mutation} failed")));
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            let terminal = store.get_run(run_id).await.unwrap().unwrap();
+            assert_eq!(
+                terminal.status,
+                if cancel_before_mutation {
+                    agentd_api::AgentRunStatus::Cancelled
+                } else {
+                    agentd_api::AgentRunStatus::Failed
+                }
+            );
+            assert!(terminal.output.is_none());
+            assert!(store
+                .finalize_run_success(run_id, &json!({"done":true}), None)
+                .await
+                .is_err());
+            assert!(
+                store
+                    .memory_maintenance_readiness("demo", "profile", 5)
+                    .await
+                    .unwrap()
+                    .ready
+            );
+            let trace = store.list_run_log(run_id).await.unwrap();
+            assert!(trace.iter().any(|event| event.kind == "tool"
+                && event.payload["phase"] == "result"
+                && event.payload["result"]["ok"] == false));
+            assert!(!trace.iter().any(|event| event.kind == "output"));
+            server.abort();
+        }
     }
 
     #[tokio::test]

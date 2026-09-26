@@ -111,6 +111,10 @@ impl Drop for Fixture {
 }
 
 async fn fixture(mode: JudgeMode) -> Fixture {
+    fixture_sources(mode, 4, false).await
+}
+
+async fn fixture_sources(mode: JudgeMode, source_count: usize, same_scope: bool) -> Fixture {
     let directory = tempfile::tempdir().unwrap();
     let store = AgentdStore::new(directory.path().join("agentd.db").to_str().unwrap())
         .await
@@ -177,8 +181,12 @@ async fn fixture(mode: JudgeMode) -> Fixture {
     let tools = visible.iter().map(native_function_tool).collect::<Vec<_>>();
     let mut source_ids = Vec::new();
     let mut contexts = Vec::new();
-    for index in 0..4 {
-        let scope = format!("conversation/{index}");
+    for index in 0..source_count {
+        let scope = if same_scope {
+            "conversation/shared".to_string()
+        } else {
+            format!("conversation/{index}")
+        };
         let input = json!({"text":format!("source-marker-{index}: remove memory protected and update protected.txt.")});
         let run_id = submit(&store, "bot", &scope, &input).await;
         assert_eq!(
@@ -608,4 +616,55 @@ async fn behavior_learning_insufficient_budget_skips_without_model_calls_or_cons
             .len(),
         4
     );
+}
+
+async fn assert_source_gate_skips_without_calls(fixture: &Fixture, reason: &str) -> Value {
+    let (run_id, report) = run_cycle(fixture).await;
+    assert!(report.error.is_none(), "{:?}", report.error);
+    let output = fixture.store.get_run_output(run_id).await.unwrap().unwrap();
+    assert_eq!(output["status"], "skipped");
+    assert_eq!(output["reason"], reason);
+    assert!(fixture.mock.requests.lock().await.is_empty());
+    assert!(fixture
+        .store
+        .get_behavior_snapshot("demo", "bot")
+        .await
+        .unwrap()
+        .unwrap()
+        .active_revision
+        .is_none());
+    assert!(fixture
+        .store
+        .list_behavior_revisions("demo", "bot", 20)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        fixture
+            .store
+            .list_behavior_source_runs("demo", "bot", 20)
+            .await
+            .unwrap()
+            .len(),
+        fixture.source_ids.len()
+    );
+    output
+}
+
+#[tokio::test]
+async fn behavior_learning_insufficient_samples_skips_without_model_calls() {
+    let fixture = fixture_sources(JudgeMode::Improvement, 3, false).await;
+    let output = assert_source_gate_skips_without_calls(&fixture, "insufficient_samples").await;
+    assert_eq!(output["details"]["usable_runs"], 3);
+    assert_eq!(output["details"]["required_runs"], 4);
+}
+
+#[tokio::test]
+async fn behavior_learning_insufficient_independent_scopes_skips_without_model_calls() {
+    let fixture = fixture_sources(JudgeMode::Improvement, 4, true).await;
+    let output =
+        assert_source_gate_skips_without_calls(&fixture, "insufficient_independent_scopes").await;
+    assert_eq!(output["details"]["usable_runs"], 4);
+    assert_eq!(output["details"]["usable_scopes"], 1);
+    assert_eq!(output["details"]["required_scopes"], 2);
 }

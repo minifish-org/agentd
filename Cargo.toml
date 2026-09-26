@@ -42,3 +42,8 @@ microsandbox = { version = "=0.6.16", default-features = false, features = ["net
 # drop the full DWARF symbols that bloat `target/debug` (per-dep + accumulated).
 [profile.dev]
 debug = "line-tables-only"
+
+# libsql 0.9.30 can close the same native connection twice during Drop.
+# Keep the fix reproducible until an upstream release includes it.
+[patch.crates-io]
+libsql = { path = "vendor/libsql" }

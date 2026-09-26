@@ -1,9 +1,20 @@
 # Deployment
 
-agentd normally treats runtime data as replaceable. Schema v9 supports in-place
-migration from versions 6–8, preserving runtime data while adding the required
-graph, immutable delivery payload, and behavior-learning state. Back up the
+agentd normally treats runtime data as replaceable. Schema v10 supports in-place
+migration from versions 6–9, preserving runtime data while adding the required
+graph, immutable delivery payload, behavior-learning state, and memory-maintenance
+revision checkpoints. Back up the
 data directory before starting the new version against an existing database.
+Existing populated memory namespaces receive an initial unconsumed revision
+during migration, so those meeting the entry threshold can receive one
+maintenance pass before later work requires another external content change.
+
+Startup adds missing memory-maintenance and behavior-learning resources to
+existing tenants; tenant creation does the same for new tenants. Newly created
+schedules are enabled. Existing compatible settings, including explicit
+`enabled=false`, are retained. Database eligibility checks suppress background
+runs and model calls until memory content changes or enough independent learning
+history exists. Pause either task through its schedule's `enabled` field.
 
 The deployment image includes pinned INT8 ONNX and tokenizer assets for
 multilingual E5 Small and BGE reranker v2-m3. Startup verifies every asset
@@ -24,7 +35,7 @@ also includes both model licenses beside their assets and the repository's
 8. Verify the local and remote services and the Telegram decoy page.
 9. Delete the rollback data only after the checks pass.
 
-If startup reports a schema mismatch outside the supported v6–v8 migrations,
+If startup reports a schema mismatch outside the supported v6–v9 migrations,
 use `agentd --reset-data`; do not add an ad hoc ALTER, backfill, repair endpoint,
 or legacy parser.
 

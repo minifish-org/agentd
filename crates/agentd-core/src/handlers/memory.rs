@@ -140,6 +140,15 @@ impl CapabilityEngine {
     }
 
     pub(crate) async fn execute_memory_put(&self, tenant: &str, params: &Value) -> Result<Value> {
+        self.execute_memory_put_from_run(tenant, params, None).await
+    }
+
+    pub(crate) async fn execute_memory_put_from_run(
+        &self,
+        tenant: &str,
+        params: &Value,
+        run_id: Option<uuid::Uuid>,
+    ) -> Result<Value> {
         let text = required(params, "text")?;
         if text.len() > agentd_store::MAX_MEMORY_TEXT_BYTES {
             return Err(anyhow!(
@@ -155,17 +164,29 @@ impl CapabilityEngine {
             .transpose()
             .map_err(|error| anyhow!("invalid memory graph: {error}"))?
             .unwrap_or_default();
-        let item = self
-            .store
-            .put_memory_with_graph(
-                tenant,
-                namespace(params),
-                required(params, "id")?,
-                text,
-                &embedding,
-                &graph,
-            )
-            .await?;
+        let item = if let Some(run_id) = run_id {
+            self.store
+                .put_memory_with_graph_for_run(
+                    run_id,
+                    namespace(params),
+                    required(params, "id")?,
+                    text,
+                    &embedding,
+                    &graph,
+                )
+                .await?
+        } else {
+            self.store
+                .put_memory_with_graph(
+                    tenant,
+                    namespace(params),
+                    required(params, "id")?,
+                    text,
+                    &embedding,
+                    &graph,
+                )
+                .await?
+        };
         Ok(json!({"item":item}))
     }
 
@@ -174,10 +195,25 @@ impl CapabilityEngine {
         tenant: &str,
         params: &Value,
     ) -> Result<Value> {
-        let deleted = self
-            .store
-            .delete_memory(tenant, namespace(params), required(params, "id")?)
-            .await?;
+        self.execute_memory_delete_from_run(tenant, params, None)
+            .await
+    }
+
+    pub(crate) async fn execute_memory_delete_from_run(
+        &self,
+        tenant: &str,
+        params: &Value,
+        run_id: Option<uuid::Uuid>,
+    ) -> Result<Value> {
+        let deleted = if let Some(run_id) = run_id {
+            self.store
+                .delete_memory_for_run(run_id, namespace(params), required(params, "id")?)
+                .await?
+        } else {
+            self.store
+                .delete_memory(tenant, namespace(params), required(params, "id")?)
+                .await?
+        };
         Ok(json!({"deleted":deleted}))
     }
 }

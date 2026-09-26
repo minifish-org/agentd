@@ -24,7 +24,9 @@ use uuid::Uuid;
 use db::{LibsqlPool, Row};
 
 mod behavior;
-pub use behavior::{BehaviorLearningResult, BehaviorSnapshot};
+pub use behavior::{BehaviorLearningReadiness, BehaviorLearningResult, BehaviorSnapshot};
+mod maintenance;
+pub use maintenance::{memory_maintenance_min_entries, MemoryMaintenanceReadiness};
 
 pub const MAX_MEMORY_TEXT_BYTES: usize = 4096;
 pub const MEMORY_EMBEDDING_DIM: usize = 384;
@@ -1166,6 +1168,45 @@ impl AgentdStore {
         embedding: &[f32],
         graph: &MemoryGraphInput,
     ) -> Result<MemoryItem> {
+        self.put_memory_with_source((tenant, None), namespace, id, text, embedding, graph)
+            .await
+    }
+
+    /// Runtime writes carry a trusted run ID, never a model-supplied actor.
+    pub async fn put_memory_with_graph_for_run(
+        &self,
+        run_id: Uuid,
+        namespace: &str,
+        id: &str,
+        text: &str,
+        embedding: &[f32],
+        graph: &MemoryGraphInput,
+    ) -> Result<MemoryItem> {
+        let run = self
+            .get_run(run_id)
+            .await?
+            .ok_or_else(|| anyhow!("memory writer run not found"))?;
+        self.put_memory_with_source(
+            (&run.tenant, Some(run_id)),
+            namespace,
+            id,
+            text,
+            embedding,
+            graph,
+        )
+        .await
+    }
+
+    async fn put_memory_with_source(
+        &self,
+        source: (&str, Option<Uuid>),
+        namespace: &str,
+        id: &str,
+        text: &str,
+        embedding: &[f32],
+        graph: &MemoryGraphInput,
+    ) -> Result<MemoryItem> {
+        let (tenant, source_run_id) = source;
         self.ensure_tenant_exists(tenant).await?;
         let namespace = normalize_memory_component(namespace, "namespace")?;
         let id = normalize_memory_component(id, "id")?;
@@ -1183,6 +1224,15 @@ impl AgentdStore {
         let embedding = encode_memory_embedding(embedding);
         let now = Utc::now().to_rfc3339();
         let mut tx = self.pool.begin().await?;
+        let previous_text = db::query_scalar::<String>(
+            "SELECT text FROM memory WHERE tenant = ? AND namespace = ? AND id = ?",
+        )
+        .bind(tenant)
+        .bind(&namespace)
+        .bind(&id)
+        .fetch_optional(&mut tx)
+        .await?;
+        let content_changed = previous_text.as_deref() != Some(text);
         db::query(
             "INSERT INTO memory (tenant, namespace, id, text, embedding, created_at, updated_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?) \
@@ -1246,6 +1296,14 @@ impl AgentdStore {
             .execute(&mut tx)
             .await?;
         }
+        maintenance::record_memory_change(
+            &mut tx,
+            tenant,
+            &namespace,
+            source_run_id,
+            content_changed,
+        )
+        .await?;
         tx.commit().await?;
         self.get_memory(tenant, &namespace, &id)
             .await?
@@ -1253,13 +1311,44 @@ impl AgentdStore {
     }
 
     pub async fn delete_memory(&self, tenant: &str, namespace: &str, id: &str) -> Result<bool> {
+        self.delete_memory_with_source(tenant, namespace, id, None)
+            .await
+    }
+
+    pub async fn delete_memory_for_run(
+        &self,
+        run_id: Uuid,
+        namespace: &str,
+        id: &str,
+    ) -> Result<bool> {
+        let run = self
+            .get_run(run_id)
+            .await?
+            .ok_or_else(|| anyhow!("memory writer run not found"))?;
+        self.delete_memory_with_source(&run.tenant, namespace, id, Some(run_id))
+            .await
+    }
+
+    async fn delete_memory_with_source(
+        &self,
+        tenant: &str,
+        namespace: &str,
+        id: &str,
+        source_run_id: Option<Uuid>,
+    ) -> Result<bool> {
+        let namespace = normalize_memory_component(namespace, "namespace")?;
+        let id = normalize_memory_component(id, "id")?;
+        let mut tx = self.pool.begin().await?;
         let deleted = db::query("DELETE FROM memory WHERE tenant = ? AND namespace = ? AND id = ?")
             .bind(tenant)
-            .bind(normalize_memory_component(namespace, "namespace")?)
-            .bind(normalize_memory_component(id, "id")?)
-            .execute(&self.pool)
+            .bind(&namespace)
+            .bind(&id)
+            .execute(&mut tx)
             .await?
             .rows_affected();
+        maintenance::record_memory_change(&mut tx, tenant, &namespace, source_run_id, deleted > 0)
+            .await?;
+        tx.commit().await?;
         Ok(deleted > 0)
     }
 
@@ -1433,7 +1522,7 @@ impl AgentdStore {
     }
 
     async fn initialize_schema(&self) -> Result<()> {
-        const SCHEMA_VERSION: i64 = 9;
+        const SCHEMA_VERSION: i64 = 10;
         const GRAPH_MIGRATION_SCHEMA_VERSION: i64 = 6;
         const DELIVERY_PAYLOAD_SCHEMA_VERSION: i64 = 7;
         let version = db::query_scalar::<i64>("PRAGMA user_version")
@@ -1444,6 +1533,7 @@ impl AgentdStore {
             && version != GRAPH_MIGRATION_SCHEMA_VERSION
             && version != DELIVERY_PAYLOAD_SCHEMA_VERSION
             && version != 8
+            && version != 9
             && version != SCHEMA_VERSION
         {
             return Err(anyhow!(
@@ -1634,10 +1724,11 @@ impl AgentdStore {
                 .into_iter()
                 .chain(graph_statements)
                 .chain(behavior::SCHEMA_STATEMENTS)
+                .chain(maintenance::SCHEMA_STATEMENTS)
             {
                 db::query(statement).execute(&self.pool).await?;
             }
-            db::query("PRAGMA user_version = 9")
+            db::query("PRAGMA user_version = 10")
                 .execute(&self.pool)
                 .await?;
         } else if version < SCHEMA_VERSION {
@@ -1663,7 +1754,10 @@ impl AgentdStore {
             for statement in behavior::SCHEMA_STATEMENTS {
                 db::query(statement).execute(&mut tx).await?;
             }
-            db::query("PRAGMA user_version = 9")
+            for statement in maintenance::SCHEMA_STATEMENTS {
+                db::query(statement).execute(&mut tx).await?;
+            }
+            db::query("PRAGMA user_version = 10")
                 .execute(&mut tx)
                 .await?;
             tx.commit().await?;
@@ -1917,6 +2011,23 @@ impl AgentdStore {
     pub async fn put_schedule(&self, tenant: &str, name: &str, spec: &ScheduleSpec) -> Result<()> {
         spec.validate().map_err(|error| anyhow!(error))?;
         let mut spec = spec.clone();
+        if spec.agent_ref == MEMORY_MAINTAINER_AGENT {
+            let min_entries = memory_maintenance_min_entries(&spec.payload)?;
+            let namespace = spec
+                .payload
+                .get("namespace")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("memory maintenance schedule requires namespace"))?;
+            let namespace = normalize_memory_component(namespace, "namespace")?;
+            if namespace == ALL_MEMORY_NAMESPACES && name != MEMORY_MAINTENANCE_SCHEDULE {
+                return Err(anyhow!(
+                    "wildcard memory maintenance requires the reserved schedule"
+                ));
+            }
+            spec.scope = format!("memory-maintenance/{namespace}");
+            spec.payload["namespace"] = json!(namespace);
+            spec.payload["min_entries"] = json!(min_entries);
+        }
         if spec.agent_ref == BEHAVIOR_LEARNER_AGENT {
             if spec.delivery.is_some() {
                 return Err(anyhow!("behavior learning runs do not support delivery"));
@@ -2023,7 +2134,13 @@ impl AgentdStore {
                 return Ok(existing.run_id);
             }
         }
-        let behavior_scope = if run.agent_ref == BEHAVIOR_LEARNER_AGENT {
+        let background_scope = if run.agent_ref == MEMORY_MAINTAINER_AGENT {
+            memory_maintenance_min_entries(run.input)?;
+            Some(format!(
+                "memory-maintenance/{}",
+                maintenance::maintenance_namespace(run.input)?
+            ))
+        } else if run.agent_ref == BEHAVIOR_LEARNER_AGENT {
             let payload = if run
                 .input
                 .get("activation")
@@ -2065,7 +2182,7 @@ impl AgentdStore {
         .bind(run.tenant)
         .bind(run.name)
         .bind(run.agent_ref)
-        .bind(behavior_scope.as_deref().unwrap_or(run.scope))
+        .bind(background_scope.as_deref().unwrap_or(run.scope))
         .bind(run.source)
         .bind(serde_json::to_string(run.input)?)
         .bind(status_to_wire(AgentRunStatus::Queued))
@@ -2596,6 +2713,7 @@ impl AgentdStore {
             .execute(&mut tx)
             .await?;
         }
+        maintenance::checkpoint_success(&mut tx, run_id).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -2874,6 +2992,9 @@ impl AgentdStore {
                     let mut run_spec = spec.clone();
                     run_spec.payload["namespace"] =
                         json!(namespace.try_get::<String, _>("namespace")?);
+                    if !self.background_schedule_ready(&tenant, &run_spec).await? {
+                        continue;
+                    }
                     let run_name = format!("{}-{}", name, Uuid::new_v4().simple());
                     let run_id = self
                         .submit_schedule_run(&tenant, &name, &run_spec, &run_name, now)
@@ -2896,6 +3017,9 @@ impl AgentdStore {
                     let mut run_spec = spec.clone();
                     run_spec.payload["target_agent"] = json!(agent.name);
                     run_spec.scope = format!("behavior-learning/{}", agent.name);
+                    if !self.background_schedule_ready(&tenant, &run_spec).await? {
+                        continue;
+                    }
                     let run_name = format!("{}-{}", name, Uuid::new_v4().simple());
                     let run_id = self
                         .submit_schedule_run(&tenant, &name, &run_spec, &run_name, now)
@@ -2904,16 +3028,18 @@ impl AgentdStore {
                     last_run_id = Some(run_id);
                 }
             } else {
-                let run_name = format!("{}-{}", name, Uuid::new_v4().simple());
-                let run_id = self
-                    .submit_schedule_run(&tenant, &name, &spec, &run_name, now)
-                    .await?;
-                triggered.push(run_id);
-                last_run_id = Some(run_id);
+                if self.background_schedule_ready(&tenant, &spec).await? {
+                    let run_name = format!("{}-{}", name, Uuid::new_v4().simple());
+                    let run_id = self
+                        .submit_schedule_run(&tenant, &name, &spec, &run_name, now)
+                        .await?;
+                    triggered.push(run_id);
+                    last_run_id = Some(run_id);
+                }
             }
             let next_trigger = next_trigger_time(&spec, now + chrono::Duration::seconds(1))?;
             db::query(
-                "UPDATE schedules SET last_triggered_at = ?, next_trigger_at = ?, last_run_id = ?, updated_at = ? WHERE tenant = ? AND name = ?",
+                "UPDATE schedules SET last_triggered_at = ?, next_trigger_at = ?, last_run_id = COALESCE(?, last_run_id), updated_at = ? WHERE tenant = ? AND name = ?",
             )
             .bind(now.to_rfc3339())
             .bind(next_trigger.map(|value| value.to_rfc3339()))
@@ -2925,6 +3051,35 @@ impl AgentdStore {
             .await?;
         }
         Ok(triggered)
+    }
+
+    async fn background_schedule_ready(&self, tenant: &str, spec: &ScheduleSpec) -> Result<bool> {
+        if spec.agent_ref == BEHAVIOR_LEARNER_AGENT {
+            let options = serde_json::from_value(spec.payload.clone())?;
+            return Ok(self
+                .behavior_learning_readiness(tenant, &options)
+                .await?
+                .ready);
+        }
+        if spec.agent_ref == MEMORY_MAINTAINER_AGENT {
+            let namespace = maintenance::maintenance_namespace(&spec.payload)?;
+            let scope = format!("memory-maintenance/{namespace}");
+            let pending = db::query_scalar::<String>(
+                "SELECT run_id FROM runs WHERE tenant = ? AND agent_ref = ? AND scope = ? AND status IN ('queued', 'running') LIMIT 1",
+            ).bind(tenant).bind(MEMORY_MAINTAINER_AGENT).bind(scope).fetch_optional(&self.pool).await?;
+            if pending.is_some() {
+                return Ok(false);
+            }
+            return Ok(self
+                .memory_maintenance_readiness(
+                    tenant,
+                    &namespace,
+                    memory_maintenance_min_entries(&spec.payload)?,
+                )
+                .await?
+                .ready);
+        }
+        Ok(true)
     }
 
     async fn submit_schedule_run(
@@ -3011,6 +3166,8 @@ impl AgentdStore {
             "mcp_servers",
             "behavior_heads",
             "behavior_revisions",
+            "memory_maintenance_state",
+            "memory_maintenance_runs",
             "agents",
         ] {
             db::query(&format!("DELETE FROM {table} WHERE tenant = ?"))
@@ -3553,6 +3710,42 @@ mod tests {
         let path = dir.path().join("agentd.db");
         let store = AgentdStore::new(path.to_str().unwrap()).await.unwrap();
         (dir, store)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn parallel_connection_teardown_preserves_live_statements_and_transactions() {
+        // Exercise native-handle reuse across threads. libsql 0.9.30 used to
+        // close the final connection twice, corrupting unrelated allocations.
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            tasks.spawn(async {
+                for i in 0..128 {
+                    let db = Builder::new_local(":memory:").build().await.unwrap();
+                    let conn = db.connect().unwrap();
+                    conn.execute("CREATE TABLE t(x INTEGER)", ()).await.unwrap();
+                    let tx = conn.transaction().await.unwrap();
+                    tx.execute("INSERT INTO t VALUES (1)", ()).await.unwrap();
+                    drop(conn);
+                    if i % 2 == 0 {
+                        tx.commit().await.unwrap();
+                    } else {
+                        tx.rollback().await.unwrap();
+                    }
+
+                    let conn = db.connect().unwrap();
+                    let statement = conn.prepare("SELECT 42").await.unwrap();
+                    drop(conn);
+                    let mut rows = statement.query(()).await.unwrap();
+                    assert_eq!(
+                        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+                        42
+                    );
+                }
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
     }
 
     fn test_embedding(axis: usize) -> Vec<f32> {
@@ -4321,11 +4514,23 @@ mod tests {
             .unwrap();
         let embedding = test_embedding(0);
         for namespace in ["bot", "default", "shared", MEMORY_MAINTAINER_AGENT] {
-            store
-                .put_memory("one", namespace, "fact", "tenant one fact", &embedding)
-                .await
-                .unwrap();
+            for index in 0..5 {
+                store
+                    .put_memory(
+                        "one",
+                        namespace,
+                        &format!("fact-{index}"),
+                        "tenant one fact",
+                        &embedding,
+                    )
+                    .await
+                    .unwrap();
+            }
         }
+        store
+            .put_memory("one", "sparse", "fact", "one fact", &embedding)
+            .await
+            .unwrap();
         store
             .put_memory("two", "other", "fact", "tenant two fact", &embedding)
             .await
@@ -4356,6 +4561,61 @@ mod tests {
         }
         namespaces.sort();
         assert_eq!(namespaces, vec!["bot", "default", "shared"]);
+        // A second trigger cannot stack work for a namespace already queued.
+        db::query("UPDATE schedules SET next_trigger_at = ? WHERE tenant = 'one'")
+            .bind((now - ChronoDuration::seconds(1)).to_rfc3339())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert!(store
+            .trigger_due_schedules(now, 32)
+            .await
+            .unwrap()
+            .is_empty());
+        while let Some(assigned) = store.claim_next_run().await.unwrap() {
+            assert!(
+                store
+                    .prepare_memory_maintenance(assigned.run.run_id, 5)
+                    .await
+                    .unwrap()
+                    .ready
+            );
+            store
+                .finalize_run_success(assigned.run.run_id, &json!({"scanned":5}), None)
+                .await
+                .unwrap();
+        }
+        db::query("UPDATE schedules SET next_trigger_at = ? WHERE tenant = 'one'")
+            .bind((now - ChronoDuration::seconds(1)).to_rfc3339())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert!(store
+            .trigger_due_schedules(now, 32)
+            .await
+            .unwrap()
+            .is_empty());
+        let last = store
+            .get_schedule("one", MEMORY_MAINTENANCE_SCHEDULE)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(last.last_run_id.is_some());
+        store
+            .put_memory("one", "bot", "new-fact", "new fact", &embedding)
+            .await
+            .unwrap();
+        db::query("UPDATE schedules SET next_trigger_at = ? WHERE tenant = 'one'")
+            .bind((now - ChronoDuration::seconds(1)).to_rfc3339())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let next = store.trigger_due_schedules(now, 32).await.unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(
+            store.get_run(next[0]).await.unwrap().unwrap().input["namespace"],
+            "bot"
+        );
     }
 
     #[tokio::test]
@@ -4454,7 +4714,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_schema_stays_single_table_plus_fts() {
+    async fn memory_content_and_maintenance_metadata_use_separate_tables() {
         let (_dir, store) = store().await;
         let tables = db::query_scalar::<String>(
             "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'memory%' ORDER BY name",
@@ -4470,7 +4730,9 @@ mod tests {
                 "memory_fts_config",
                 "memory_fts_data",
                 "memory_fts_docsize",
-                "memory_fts_idx"
+                "memory_fts_idx",
+                "memory_maintenance_runs",
+                "memory_maintenance_state"
             ]
         );
     }
@@ -4515,7 +4777,7 @@ mod tests {
                 .fetch_optional(&migrated.pool)
                 .await
                 .unwrap(),
-            Some(9)
+            Some(10)
         );
         assert!(migrated
             .get_memory("one", "profile", "favorite")
@@ -4567,7 +4829,7 @@ mod tests {
                 .fetch_optional(&migrated.pool)
                 .await
                 .unwrap(),
-            Some(9)
+            Some(10)
         );
     }
 

@@ -232,6 +232,12 @@ impl CapabilityEngine {
                 Some(manager) => manager.execute(context, params).await,
                 None => Err(anyhow!("sandbox capability is disabled")),
             }
+        } else if tool.name == "memory_put" {
+            self.execute_memory_put_from_run(tenant, params, Some(context.run_id))
+                .await
+        } else if tool.name == "memory_delete" {
+            self.execute_memory_delete_from_run(tenant, params, Some(context.run_id))
+                .await
         } else {
             self.execute_builtin_tool(tenant, &tool.name, params).await
         };

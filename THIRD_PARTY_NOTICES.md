@@ -52,3 +52,11 @@ The bundled asset set is limited to:
 - `special_tokens_map.json`
 - `tokenizer.json`
 - `tokenizer_config.json`
+
+## tursodatabase/libsql
+
+agentd uses MIT-licensed [`libsql`](https://github.com/tursodatabase/libsql)
+version `0.9.30`. A local copy in `vendor/libsql` makes native connection
+shutdown idempotent; see its [patch notes](vendor/libsql/AGENTD_PATCH.md) and
+[upstream license](vendor/libsql/LICENSE.md). Other dependencies remain from
+their original registry sources.

@@ -13,7 +13,10 @@ use crate::handlers::mcp::{
     delete_mcp_server, get_mcp_server, list_mcp_servers, put_mcp_server, rediscover_enabled_servers,
 };
 use crate::handlers::memory::{get_memory_item, search_memory};
-use crate::handlers::presets::{install_behavior_learning, install_memory_maintenance};
+use crate::handlers::presets::{
+    ensure_behavior_learning, ensure_memory_maintenance, install_behavior_learning,
+    install_memory_maintenance,
+};
 use crate::handlers::runs::{cancel_run, get_run, get_run_trace, list_runs, wait_run};
 use crate::handlers::schedules::{delete_schedule, get_schedule, list_schedules, put_schedule};
 use crate::handlers::tools::list_tools;
@@ -70,6 +73,7 @@ pub(crate) async fn run_server(config_path: &str, reset_data: bool) -> Result<()
 
     let store = AgentdStore::new(&cfg.database_path).await?;
     store.reset_local_runtime_state().await?;
+    bootstrap_background_presets(&store).await?;
     let sandbox_manager = match cfg.sandbox_runtime_config()? {
         Some(config) => Some(
             agentd_core::SandboxSessionManager::new_microsandbox(config)
@@ -134,6 +138,34 @@ pub(crate) async fn run_server(config_path: &str, reset_data: bool) -> Result<()
     let result = rest.await;
     app_state.capabilities.cleanup_all_sandboxes().await;
     result?;
+    Ok(())
+}
+
+async fn bootstrap_background_presets(store: &AgentdStore) -> Result<()> {
+    for tenant in store.list_tenants().await? {
+        let results = [
+            ensure_memory_maintenance(store, &tenant).await,
+            ensure_behavior_learning(
+                store,
+                &tenant,
+                &agentd_api::BehaviorLearningOptions::default(),
+            )
+            .await,
+        ];
+        for result in results {
+            match result {
+                Ok(_) => {}
+                Err(error) if error.is_conflict() => {
+                    tracing::warn!(tenant, error = %error, "background preset conflicts with an existing reserved resource; preserving it");
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("failed to initialize background presets for tenant {tenant}")
+                    })
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -309,6 +341,15 @@ mod tests {
         (status, value)
     }
 
+    fn named_item<'a>(items: &'a Value, name: &str) -> &'a Value {
+        items
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == name)
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn tenant_rest_turn_trace_cancel_artifact_and_removed_routes() {
         let (_dir, app) = app().await;
@@ -482,7 +523,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn behavior_learning_preset_is_tenant_scoped_restricted_and_disabled() {
+    async fn behavior_learning_preset_is_automatic_tenant_scoped_and_enabled() {
         let (_dir, app) = app().await;
         assert_eq!(
             request(
@@ -509,7 +550,9 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(installed.0, StatusCode::CREATED);
+        assert_eq!(installed.0, StatusCode::OK);
+        assert_eq!(installed.1["agent_created"], false);
+        assert_eq!(installed.1["schedule_created"], false);
         assert_eq!(installed.1["agent_ref"], "system/behavior-learner");
         assert_eq!(installed.1["schedule"], "system/behavior-learning");
 
@@ -526,11 +569,11 @@ mod tests {
         assert_eq!(agent["timeout_ms"], 900_000);
         assert_eq!(agent["max_steps"], 64);
         let (_, schedules) = request(&app, Method::GET, "/v1/tenants/demo/schedules", None).await;
-        assert_eq!(schedules.as_array().unwrap().len(), 1);
-        assert_eq!(schedules[0]["spec"]["enabled"], false);
+        assert_eq!(schedules.as_array().unwrap().len(), 2);
+        assert_eq!(schedules[0]["spec"]["enabled"], true);
         assert_eq!(schedules[0]["spec"]["delivery"], Value::Null);
         assert_eq!(schedules[0]["spec"]["payload"]["target_agent"], "*");
-        assert_eq!(schedules[0]["next_trigger_at"], Value::Null);
+        assert!(!schedules[0]["next_trigger_at"].is_null());
         assert_eq!(
             request(&app, Method::GET, "/v1/tenants/demo/runs", None)
                 .await
@@ -577,6 +620,17 @@ mod tests {
                 expected
             );
         }
+        // Creation already installed defaults. Remove these resources to test
+        // explicit installation with operator-provided options.
+        for uri in [
+            "/v1/tenants/demo/schedules/system%2Fbehavior-learning",
+            "/v1/tenants/demo/agents/system%2Fbehavior-learner",
+        ] {
+            assert_eq!(
+                request(&app, Method::DELETE, uri, None).await.0,
+                StatusCode::OK
+            );
+        }
         let options = json!({
             "target_agent":"bot", "proposer_model":"deepseek-chat", "judge_model":"judge/chat",
             "min_samples":8, "max_samples":10, "max_model_calls":64, "max_tokens":1024,
@@ -596,7 +650,7 @@ mod tests {
         let (_, schedules) = request(&app, Method::GET, "/v1/tenants/demo/schedules", None).await;
         let mut schedule = schedules[0]["spec"].clone();
         assert_eq!(schedule["payload"], options);
-        schedule["enabled"] = json!(true);
+        schedule["enabled"] = json!(false);
         schedule["cron"] = json!("0 5 * * 1");
         request(
             &app,
@@ -625,6 +679,7 @@ mod tests {
         assert_eq!(reapplied.1["schedule_created"], false);
         let (_, schedules) = request(&app, Method::GET, "/v1/tenants/demo/schedules", None).await;
         assert_eq!(schedules[0]["spec"], schedule);
+        assert!(schedules[0]["next_trigger_at"].is_null());
         let (_, agent) = request(
             &app,
             Method::GET,
@@ -647,6 +702,8 @@ mod tests {
             Some(json!({"name":"demo"})),
         )
         .await;
+        let (_, original_schedules) =
+            request(&app, Method::GET, "/v1/tenants/demo/schedules", None).await;
         request(
             &app,
             Method::PUT,
@@ -669,7 +726,7 @@ mod tests {
             request(&app, Method::GET, "/v1/tenants/demo/schedules", None)
                 .await
                 .1,
-            json!([])
+            original_schedules
         );
         request(
             &app,
@@ -840,14 +897,167 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_maintenance_preset_is_tenant_scoped_restricted_and_disabled() {
+    async fn startup_repairs_missing_presets_and_preserves_existing_disabled_schedules() {
+        let (dir, app) = app().await;
+        let store = AgentdStore::new(dir.path().join("agentd.db").to_str().unwrap())
+            .await
+            .unwrap();
+        // These tenants predate server-managed preset installation.
+        for tenant in ["legacy", "disabled"] {
+            store.create_tenant(tenant, &json!({})).await.unwrap();
+        }
+        bootstrap_background_presets(&store).await.unwrap();
+        for tenant in ["legacy", "disabled"] {
+            assert_eq!(store.list_agents(Some(tenant)).await.unwrap().len(), 2);
+            let schedules = store.list_schedules(Some(tenant)).await.unwrap();
+            assert_eq!(schedules.len(), 2);
+            assert!(schedules
+                .iter()
+                .all(|schedule| schedule.spec.enabled && schedule.next_trigger_at.is_some()));
+        }
+        let mut disabled_specs = Vec::new();
+        for schedule in store.list_schedules(Some("disabled")).await.unwrap() {
+            let mut spec = schedule.spec;
+            spec.enabled = false;
+            spec.cron = Some("15 2 * * 2".into());
+            store
+                .put_schedule("disabled", &schedule.name, &spec)
+                .await
+                .unwrap();
+            disabled_specs.push((schedule.name, spec));
+        }
+        for agent in store.list_agents(Some("disabled")).await.unwrap() {
+            let mut spec = agent.spec;
+            spec.context_window = Some(3);
+            store
+                .apply_agent(&agentd_api::AgentResource {
+                    metadata: agent.metadata,
+                    spec,
+                })
+                .await
+                .unwrap();
+        }
+        store
+            .delete_agent("legacy", agentd_api::MEMORY_MAINTAINER_AGENT)
+            .await
+            .unwrap();
+        store
+            .delete_schedule("legacy", agentd_api::MEMORY_MAINTENANCE_SCHEDULE)
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            bootstrap_background_presets(&store).await.unwrap();
+            for (name, expected) in &disabled_specs {
+                let schedule = store.get_schedule("disabled", name).await.unwrap().unwrap();
+                assert_eq!(&schedule.spec, expected);
+                assert!(schedule.next_trigger_at.is_none());
+            }
+        }
+        assert!(
+            store
+                .get_schedule("legacy", agentd_api::MEMORY_MAINTENANCE_SCHEDULE)
+                .await
+                .unwrap()
+                .unwrap()
+                .spec
+                .enabled
+        );
+        assert!(store
+            .list_agents(Some("disabled"))
+            .await
+            .unwrap()
+            .iter()
+            .all(|agent| agent.spec.context_window == Some(0)));
+        // Retrying tenant creation is also idempotent and keeps explicit opt-outs.
+        let repeated = request(
+            &app,
+            Method::POST,
+            "/v1/tenants",
+            Some(json!({"name":"disabled"})),
+        )
+        .await;
+        assert_eq!(repeated.0, StatusCode::OK);
+        assert_eq!(repeated.1["created"], false);
+        for (name, expected) in disabled_specs {
+            assert_eq!(
+                store
+                    .get_schedule("disabled", &name)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .spec,
+                expected
+            );
+        }
+        assert_eq!(
+            request(&app, Method::GET, "/v1/tenants/legacy/runs", None)
+                .await
+                .1,
+            json!([])
+        );
+        assert_eq!(
+            request(&app, Method::GET, "/v1/tenants/disabled/runs", None)
+                .await
+                .1,
+            json!([])
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_preserves_reserved_conflicts_and_installs_other_presets() {
+        let (dir, _app) = app().await;
+        let store = AgentdStore::new(dir.path().join("agentd.db").to_str().unwrap())
+            .await
+            .unwrap();
+        store.create_tenant("conflict", &json!({})).await.unwrap();
+        ensure_memory_maintenance(&store, "conflict").await.unwrap();
+        let original = store
+            .get_agent("conflict", agentd_api::MEMORY_MAINTAINER_AGENT)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut spec = original.spec;
+        spec.allowed_families = Some(vec![]);
+        spec.context_window = Some(3);
+        store
+            .apply_agent(&agentd_api::AgentResource {
+                metadata: original.metadata,
+                spec: spec.clone(),
+            })
+            .await
+            .unwrap();
+        bootstrap_background_presets(&store).await.unwrap();
+        let preserved = store
+            .get_agent("conflict", agentd_api::MEMORY_MAINTAINER_AGENT)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(preserved.spec, spec);
+        assert!(store
+            .get_agent("conflict", agentd_api::BEHAVIOR_LEARNER_AGENT)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(
+            store
+                .get_schedule("conflict", agentd_api::BEHAVIOR_LEARNING_SCHEDULE)
+                .await
+                .unwrap()
+                .unwrap()
+                .spec
+                .enabled
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_maintenance_is_automatic_and_preserves_explicit_disable() {
         let (_dir, app) = app().await;
         assert_eq!(
             request(
                 &app,
                 Method::POST,
                 "/v1/tenants/missing/presets/memory-maintenance",
-                None,
+                None
             )
             .await
             .0,
@@ -858,13 +1068,12 @@ mod tests {
                 &app,
                 Method::POST,
                 "/v1/tenants",
-                Some(json!({"name":"demo"})),
+                Some(json!({"name":"demo"}))
             )
             .await
             .0,
             StatusCode::CREATED
         );
-
         let installed = request(
             &app,
             Method::POST,
@@ -872,67 +1081,56 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(installed.0, StatusCode::CREATED);
+        assert_eq!(installed.0, StatusCode::OK);
         assert_eq!(installed.1["agent_ref"], "system/memory-maintainer");
         assert_eq!(installed.1["schedule"], "system/memory-maintenance");
-        assert_eq!(installed.1["agent_created"], true);
-        assert_eq!(installed.1["schedule_created"], true);
+        assert_eq!(installed.1["agent_created"], false);
+        assert_eq!(installed.1["schedule_created"], false);
 
         let (_, agents) = request(&app, Method::GET, "/v1/tenants/demo/agents", None).await;
-        assert_eq!(agents.as_array().unwrap().len(), 1);
-        assert_eq!(agents[0]["name"], "system/memory-maintainer");
-        assert_eq!(agents[0]["allowed_families"], json!(["memory"]));
-        assert_eq!(agents[0]["model"], "standard/chat");
-        assert_eq!(agents[0]["max_steps"], 64);
-        assert_eq!(agents[0]["context_window"], 0);
-        assert_eq!(
-            request(
-                &app,
-                Method::GET,
-                "/v1/tenants/demo/agents/system%2Fmemory-maintainer",
-                None,
-            )
-            .await
-            .0,
-            StatusCode::OK
-        );
-
+        assert_eq!(agents.as_array().unwrap().len(), 2);
+        let agent = named_item(&agents, "system/memory-maintainer");
+        assert_eq!(agent["allowed_families"], json!(["memory"]));
+        assert_eq!(agent["model"], "standard/chat");
+        assert_eq!(agent["max_steps"], 64);
+        assert_eq!(agent["context_window"], 0);
         let (_, schedules) = request(&app, Method::GET, "/v1/tenants/demo/schedules", None).await;
-        assert_eq!(schedules.as_array().unwrap().len(), 1);
-        assert_eq!(schedules[0]["name"], "system/memory-maintenance");
-        assert_eq!(schedules[0]["spec"]["enabled"], false);
-        assert_eq!(schedules[0]["spec"]["payload"]["namespace"], "*");
-        assert_eq!(schedules[0]["spec"]["delivery"], Value::Null);
-        assert_eq!(schedules[0]["next_trigger_at"], Value::Null);
+        assert_eq!(schedules.as_array().unwrap().len(), 2);
+        let schedule = named_item(&schedules, "system/memory-maintenance");
+        assert_eq!(schedule["spec"]["enabled"], true);
+        assert_eq!(schedule["spec"]["payload"]["namespace"], "*");
+        assert_eq!(schedule["spec"]["payload"]["min_entries"], 5);
+        assert_eq!(schedule["spec"]["delivery"], Value::Null);
+        assert!(!schedule["next_trigger_at"].is_null());
 
-        let mut enabled_spec = schedules[0]["spec"].clone();
-        enabled_spec["enabled"] = json!(true);
+        let mut disabled_spec = schedule["spec"].clone();
+        disabled_spec["enabled"] = json!(false);
         assert_eq!(
             request(
                 &app,
                 Method::PUT,
                 "/v1/tenants/demo/schedules/system%2Fmemory-maintenance",
-                Some(enabled_spec),
+                Some(disabled_spec.clone())
             )
             .await
             .0,
             StatusCode::OK
         );
-
-        let mut legacy_agent = agents[0].clone();
+        let mut legacy_agent = agent.clone();
         legacy_agent["model"] = Value::Null;
+        legacy_agent["context_window"] = json!(4);
+        legacy_agent["temperature"] = json!(0.3);
         assert_eq!(
             request(
                 &app,
                 Method::PUT,
                 "/v1/tenants/demo/agents/system%2Fmemory-maintainer",
-                Some(legacy_agent),
+                Some(legacy_agent)
             )
             .await
             .0,
             StatusCode::OK
         );
-
         let repeated = request(
             &app,
             Method::POST,
@@ -941,22 +1139,35 @@ mod tests {
         )
         .await;
         assert_eq!(repeated.0, StatusCode::OK);
-        assert_eq!(repeated.1["agent_created"], false);
-        assert_eq!(repeated.1["schedule_created"], false);
-        let (_, agents) = request(&app, Method::GET, "/v1/tenants/demo/agents", None).await;
-        assert_eq!(agents[0]["model"], "standard/chat");
+        assert_eq!(repeated.1["agent_updated"], true);
+        let (_, repaired) = request(
+            &app,
+            Method::GET,
+            "/v1/tenants/demo/agents/system%2Fmemory-maintainer",
+            None,
+        )
+        .await;
+        assert_eq!(repaired["model"], "standard/chat");
+        assert_eq!(repaired["context_window"], 0);
+        assert!((repaired["temperature"].as_f64().unwrap() - 0.3).abs() < 0.001);
         let (_, schedules) = request(&app, Method::GET, "/v1/tenants/demo/schedules", None).await;
-        assert_eq!(schedules[0]["spec"]["enabled"], true);
-        assert!(!schedules[0]["next_trigger_at"].is_null());
+        let schedule = named_item(&schedules, "system/memory-maintenance");
+        assert_eq!(schedule["spec"], disabled_spec);
+        assert!(schedule["next_trigger_at"].is_null());
 
-        let mut legacy_spec = schedules[0]["spec"].clone();
+        // The historical default-only preset had no min_entries property.
+        let mut legacy_spec = disabled_spec;
         legacy_spec["payload"]["namespace"] = json!("default");
+        legacy_spec["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("min_entries");
         assert_eq!(
             request(
                 &app,
                 Method::PUT,
                 "/v1/tenants/demo/schedules/system%2Fmemory-maintenance",
-                Some(legacy_spec),
+                Some(legacy_spec)
             )
             .await
             .0,
@@ -971,7 +1182,16 @@ mod tests {
         .await;
         assert_eq!(upgraded.1["schedule_updated"], true);
         let (_, schedules) = request(&app, Method::GET, "/v1/tenants/demo/schedules", None).await;
-        assert_eq!(schedules[0]["spec"]["enabled"], true);
-        assert_eq!(schedules[0]["spec"]["payload"]["namespace"], "*");
+        let schedule = named_item(&schedules, "system/memory-maintenance");
+        assert_eq!(schedule["spec"]["enabled"], false);
+        assert_eq!(schedule["spec"]["payload"]["namespace"], "*");
+        assert_eq!(schedule["spec"]["payload"]["min_entries"], 5);
+        assert!(schedule["next_trigger_at"].is_null());
+        assert_eq!(
+            request(&app, Method::GET, "/v1/tenants/demo/runs", None)
+                .await
+                .1,
+            json!([])
+        );
     }
 }

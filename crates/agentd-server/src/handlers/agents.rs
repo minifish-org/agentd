@@ -1,3 +1,4 @@
+use super::presets::ensure_background_presets;
 use crate::{error_response, json_result, AppState};
 use agentd_api::{Agent, AgentLimits, AgentResource, AgentSpec, ResourceMeta, ToolFamily};
 use agentd_store::TenantMetadataPatchResult;
@@ -74,15 +75,20 @@ pub(crate) async fn create_tenant(
     Json(req): Json<TenantCreateRequest>,
 ) -> impl IntoResponse {
     match state.store.create_tenant(&req.name, &req.metadata).await {
-        Ok((tenant, created)) => (
-            if created {
-                StatusCode::CREATED
-            } else {
-                StatusCode::OK
-            },
-            Json(serde_json::json!({"tenant":tenant,"created":created})),
-        )
-            .into_response(),
+        Ok((tenant, created)) => {
+            if let Err(error) = ensure_background_presets(&state.store, &tenant.name).await {
+                return error.into_response();
+            }
+            (
+                if created {
+                    StatusCode::CREATED
+                } else {
+                    StatusCode::OK
+                },
+                Json(serde_json::json!({"tenant":tenant,"created":created})),
+            )
+                .into_response()
+        }
         Err(error) => error_response(error),
     }
 }

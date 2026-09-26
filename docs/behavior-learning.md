@@ -3,7 +3,9 @@
 agentd can periodically propose and evaluate an instruction supplement for each
 foreground agent in a tenant. An independent model judge compares the current
 instructions with the proposal. A passing proposal becomes active automatically;
-there is no human approval step.
+there is no human approval step. New tenants receive the enabled background
+schedule automatically; startup adds missing resources to existing tenants.
+An existing schedule, including an explicit `enabled=false`, is preserved.
 
 This works with a standard OpenAI-compatible chat-completions API, including
 DeepSeek. It optimizes instructions using AI feedback. It does not train model
@@ -11,49 +13,58 @@ weights, implement a policy-gradient algorithm, or collect human feedback for
 RLHF. The measured result is the quality of the next assistant decision on
 historical inputs, not end-to-end success on a newly executed task.
 
-## Install and enable
+## Automatic setup and configuration
 
-Create the tenant and foreground agents first, then install the optional preset:
-
-```sh
-curl -X POST http://127.0.0.1:8080/v1/tenants/demo/presets/behavior-learning \
-  -H 'content-type: application/json' \
-  -d '{"target_agent":"*","judge_model":"deepseek-chat"}'
-```
-
-An empty request body uses defaults. Add your configured authorization header
-when the server requires an API token. Installation creates:
+Creating a tenant, or starting the server with an existing tenant, ensures:
 
 - `system/behavior-learner`, with no tool families and no rolling context;
-- `system/behavior-learning`, a disabled Sunday 04:00 schedule in
+- `system/behavior-learning`, an enabled Sunday 04:00 schedule in
   `Asia/Singapore`, with no delivery destination.
 
-The default target `*` expands when the schedule fires into separate runs for
-the tenant's foreground agents. Agents named `system/...` or labelled
-`agentd.system=true` are excluded. Each target receives a separate learning
-scope. A newly registered foreground agent is included at the next trigger.
+The default target `*` considers the tenant's foreground agents when the
+schedule fires. Agents named `system/...` or labelled `agentd.system=true` are
+excluded. A target is queued only when a database precheck finds at least
+`min_samples` new terminal source runs (eight by default), at least two distinct
+conversation scopes, and no queued or running learning cycle for that target.
+Source runs must belong to the current agent lifecycle and be newer than its
+consumed cursor. This precheck reads only a bounded set of source scopes; it
+does not call a model or establish that all traces are usable for evaluation.
 
-Enable the existing schedule through the normal schedule API:
+If the precheck fails, the scheduler advances to the next trigger without
+creating a run or calling a model. Each eligible target receives a separate
+learning scope. Newly registered foreground agents become eligible after enough
+independent history accumulates. The runtime still checks usable traces, current
+tool schemas, scope separation, and the complete model-call budget before making
+any model call. An already queued or manually submitted run may record a
+`skipped` result at those checks.
+
+Configure the existing schedule through the normal schedule API, for example
+to select a judge model. Add your configured authorization header when required:
 
 ```sh
 curl -s http://127.0.0.1:8080/v1/tenants/demo/schedules/system%2Fbehavior-learning \
-  | jq '.spec | .enabled = true' > /tmp/agentd-behavior-schedule.json
+  | jq '.spec | .payload.judge_model = "deepseek-chat"' > /tmp/agentd-behavior-schedule.json
 curl -X PUT http://127.0.0.1:8080/v1/tenants/demo/schedules/system%2Fbehavior-learning \
   -H 'content-type: application/json' \
   --data-binary @/tmp/agentd-behavior-schedule.json
 ```
 
-Once enabled, sampling, proposing, judging, and promotion run automatically.
-Reapplying the preset preserves an existing compatible schedule, including its
-payload and enabled state. It repairs the learner's context window to zero,
+Sampling, proposing, judging, and promotion run automatically once enough data
+exists. Set `enabled=false` through the same API to pause, or `true` to re-enable
+an explicitly paused schedule.
+
+`POST .../presets/behavior-learning` remains available to repair missing
+resources. Reapplying it preserves an existing compatible schedule, including
+its payload and enabled state. It repairs the learner's context window to zero,
 preserves its other compatible settings, and rejects a reserved learner with
 tool capabilities or a reserved schedule pointing to another agent with `409`.
-Use schedule PUT to change installed options.
 
 ## Options and budgets
 
-The preset's optional JSON body becomes the schedule payload. Unknown fields
-and invalid values are rejected.
+Options live in the schedule payload. If the preset must create a missing
+schedule, its optional JSON body supplies these options; an empty body uses
+defaults. The preset preserves an already installed schedule, so use schedule
+PUT to change its options. Unknown fields and invalid values are rejected.
 
 | Field | Default | Meaning |
 | --- | --- | --- |
