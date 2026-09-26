@@ -177,9 +177,14 @@ Install the optional per-tenant maintenance resources explicitly with
 memory-only `system/memory-maintainer` agent pinned to `standard/chat` and a weekly
 `system/memory-maintenance` schedule. The schedule starts disabled and has no
 delivery destination, so installation alone produces no model calls or memory
-changes. Enable or customize it through the normal schedule API. Maintainer runs
-cannot succeed or mutate memory until they complete `memory_list` pagination for
-the namespace supplied by the run input.
+changes. Once enabled, each trigger creates a separate run for every populated
+memory namespace in that tenant, including agent-named namespaces and `default`,
+but excluding `system/memory-maintainer`. Namespaces are discovered when the
+schedule fires, so newly added agent memory is included automatically. The
+maintainer retains no rolling context between runs. Enable or customize the
+schedule through the normal schedule API. Maintainer runs cannot succeed or
+mutate memory until they complete `memory_list` pagination for their input
+namespace.
 
 MCP servers are tenant resources at `/v1/tenants/:tenant/mcp/:name`. Transport
 is a strict tagged object: stdio contains `command`, `args`, and optional

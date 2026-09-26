@@ -1,5 +1,8 @@
 use crate::{error_response, AppState};
-use agentd_api::{AgentLimits, AgentResource, AgentSpec, ResourceMeta, ScheduleSpec, ToolFamily};
+use agentd_api::{
+    AgentLimits, AgentResource, AgentSpec, ResourceMeta, ScheduleSpec, ToolFamily,
+    ALL_MEMORY_NAMESPACES, MEMORY_MAINTAINER_AGENT, MEMORY_MAINTENANCE_SCHEDULE,
+};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -7,9 +10,6 @@ use axum::{
     Json,
 };
 use std::collections::BTreeMap;
-
-pub(crate) const MEMORY_MAINTAINER_AGENT: &str = "system/memory-maintainer";
-pub(crate) const MEMORY_MAINTENANCE_SCHEDULE: &str = "system/memory-maintenance";
 
 const MEMORY_MAINTAINER_PROMPT: &str = r#"You maintain durable memory for the current tenant only.
 
@@ -104,7 +104,7 @@ pub(crate) async fn install_memory_maintenance(
         agent_ref: MEMORY_MAINTAINER_AGENT.to_string(),
         scope: "memory-maintenance/default".to_string(),
         payload: serde_json::json!({
-            "namespace": "default",
+            "namespace": ALL_MEMORY_NAMESPACES,
             "policy": "Scan the complete namespace and maintain durable memory; leave uncertain entries unchanged"
         }),
         delivery: None,
@@ -113,12 +113,30 @@ pub(crate) async fn install_memory_maintenance(
         timezone: Some("Asia/Singapore".to_string()),
         enabled: false,
     };
-    let schedule_created = match state
+    let (schedule_created, schedule_updated) = match state
         .store
         .get_schedule(&tenant, MEMORY_MAINTENANCE_SCHEDULE)
         .await
     {
-        Ok(Some(existing)) if existing.spec.agent_ref == MEMORY_MAINTAINER_AGENT => false,
+        Ok(Some(existing)) if existing.spec.agent_ref == MEMORY_MAINTAINER_AGENT => {
+            let mut legacy = schedule.clone();
+            legacy.enabled = existing.spec.enabled;
+            legacy.payload["namespace"] = serde_json::json!("default");
+            if existing.spec == legacy {
+                let mut updated = schedule.clone();
+                updated.enabled = existing.spec.enabled;
+                if let Err(error) = state
+                    .store
+                    .put_schedule(&tenant, MEMORY_MAINTENANCE_SCHEDULE, &updated)
+                    .await
+                {
+                    return error_response(error);
+                }
+                (false, true)
+            } else {
+                (false, false)
+            }
+        }
         Ok(Some(_)) => {
             return (
                 StatusCode::CONFLICT,
@@ -136,7 +154,7 @@ pub(crate) async fn install_memory_maintenance(
             {
                 return error_response(error);
             }
-            true
+            (true, false)
         }
         Err(error) => return error_response(error),
     };
@@ -152,7 +170,8 @@ pub(crate) async fn install_memory_maintenance(
             "agent_ref": MEMORY_MAINTAINER_AGENT,
             "schedule": MEMORY_MAINTENANCE_SCHEDULE,
             "agent_created": agent_created,
-            "schedule_created": schedule_created
+            "schedule_created": schedule_created,
+            "schedule_updated": schedule_updated
         })),
     )
         .into_response()

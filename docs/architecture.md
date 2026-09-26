@@ -87,7 +87,9 @@ automatic recall, or automatic write.
 Enumeration uses bounded keyset pages over one tenant and namespace. The
 optional memory maintainer is an ordinary tenant agent plus an ordinary
 disabled-by-default schedule: due work enters the same queued run, claim,
-native tool loop, and `run_log` path as interactive work. There is no background
+native tool loop, and `run_log` path as interactive work. One due schedule
+dispatches a separate run for each populated tenant memory namespace except the
+maintainer's own; its rolling context is disabled. There is no background
 agent type, heartbeat, cross-tenant maintainer, or host-side consolidation
 primitive.
 

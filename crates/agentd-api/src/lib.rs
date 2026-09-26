@@ -12,6 +12,10 @@ mod delivery;
 pub use builtin_catalog::{builtin_tool_catalog, visible_tools};
 pub use delivery::*;
 
+pub const MEMORY_MAINTAINER_AGENT: &str = "system/memory-maintainer";
+pub const MEMORY_MAINTENANCE_SCHEDULE: &str = "system/memory-maintenance";
+pub const ALL_MEMORY_NAMESPACES: &str = "*";
+
 #[derive(Debug, Error)]
 pub enum ApiError {
     #[error("validation error: {0}")]

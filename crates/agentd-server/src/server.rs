@@ -534,6 +534,7 @@ mod tests {
         assert_eq!(schedules.as_array().unwrap().len(), 1);
         assert_eq!(schedules[0]["name"], "system/memory-maintenance");
         assert_eq!(schedules[0]["spec"]["enabled"], false);
+        assert_eq!(schedules[0]["spec"]["payload"]["namespace"], "*");
         assert_eq!(schedules[0]["spec"]["delivery"], Value::Null);
         assert_eq!(schedules[0]["next_trigger_at"], Value::Null);
 
@@ -580,5 +581,30 @@ mod tests {
         let (_, schedules) = request(&app, Method::GET, "/v1/tenants/demo/schedules", None).await;
         assert_eq!(schedules[0]["spec"]["enabled"], true);
         assert!(!schedules[0]["next_trigger_at"].is_null());
+
+        let mut legacy_spec = schedules[0]["spec"].clone();
+        legacy_spec["payload"]["namespace"] = json!("default");
+        assert_eq!(
+            request(
+                &app,
+                Method::PUT,
+                "/v1/tenants/demo/schedules/system%2Fmemory-maintenance",
+                Some(legacy_spec),
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        let upgraded = request(
+            &app,
+            Method::POST,
+            "/v1/tenants/demo/presets/memory-maintenance",
+            None,
+        )
+        .await;
+        assert_eq!(upgraded.1["schedule_updated"], true);
+        let (_, schedules) = request(&app, Method::GET, "/v1/tenants/demo/schedules", None).await;
+        assert_eq!(schedules[0]["spec"]["enabled"], true);
+        assert_eq!(schedules[0]["spec"]["payload"]["namespace"], "*");
     }
 }

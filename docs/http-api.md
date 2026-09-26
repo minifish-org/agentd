@@ -120,13 +120,20 @@ items contain ID, text, and timestamps, never embeddings or database row IDs.
 
 `POST .../presets/memory-maintenance` idempotently creates the reserved
 memory-only maintainer agent, pinned to `standard/chat`, and its weekly schedule.
-The schedule is disabled and has no delivery by default. Reapplying the preset
-repairs the reserved agent's model while preserving an existing compatible
-schedule, including an operator's enabled state, namespace payload, and cron
-changes; incompatible resources using the reserved names produce `409 Conflict`.
+The schedule is disabled and has no delivery by default. When enabled, it
+dispatches one run for each populated tenant memory namespace other than the
+maintainer's own namespace. The namespace list is read at trigger time; empty
+namespaces cause no run. For a fan-out trigger, `last_run_id` identifies the last
+queued run; use the runs list to see all namespace runs. Reapplying the preset
+repairs the reserved agent's model
+and upgrades an otherwise unmodified legacy `default`-only schedule to this
+behavior while preserving its enabled state. Other compatible schedule changes,
+including an operator's namespace payload and cron changes, are preserved;
+incompatible resources using the reserved names produce `409 Conflict`.
 
 For `system/memory-maintainer` runs, the native loop binds all memory calls to
-the input namespace, requires an initial cursor-free `memory_list`, and requires
+the input namespace (including the wrapped input of scheduled runs), requires an
+initial cursor-free `memory_list`, and requires
 every returned `next_cursor` to be followed until null. `memory_put` and
 `memory_delete` are rejected until enumeration completes, and a premature final
 response fails the run instead of accepting an unverified maintenance report.

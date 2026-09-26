@@ -1,7 +1,8 @@
 use agentd_api::{
     builtin_tool_catalog, parse_timezone_offset, validate_cron_expression, validate_timezone_name,
     visible_tools, Agent, AgentResource, AgentRun, AgentRunStatus, DeliveryOutboxRecord, McpServer,
-    McpToolInvocationTarget, Schedule, ScheduleSpec, ToolFamily, ToolSpec,
+    McpToolInvocationTarget, Schedule, ScheduleSpec, ToolFamily, ToolSpec, ALL_MEMORY_NAMESPACES,
+    MEMORY_MAINTAINER_AGENT, MEMORY_MAINTENANCE_SCHEDULE,
 };
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, FixedOffset, Utc};
@@ -2747,23 +2748,53 @@ impl AgentdStore {
             let tenant = row.try_get::<String, _>("tenant")?;
             let name = row.try_get::<String, _>("name")?;
             let spec: ScheduleSpec = serde_json::from_str(&row.try_get::<String, _>("spec_json")?)?;
-            let run_name = format!("{}-{}", name, Uuid::new_v4().simple());
-            let run_id = self
-                .submit_schedule_run(&tenant, &name, &spec, &run_name, now)
+            let mut last_run_id = None;
+            if name == MEMORY_MAINTENANCE_SCHEDULE
+                && spec.agent_ref == MEMORY_MAINTAINER_AGENT
+                && spec
+                    .payload
+                    .get("namespace")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(ALL_MEMORY_NAMESPACES)
+            {
+                let namespaces = db::query(
+                    "SELECT DISTINCT namespace FROM memory WHERE tenant = ? AND namespace != ? ORDER BY namespace",
+                )
+                .bind(&tenant)
+                .bind(MEMORY_MAINTAINER_AGENT)
+                .fetch_all(&self.pool)
                 .await?;
+                for namespace in namespaces {
+                    let mut run_spec = spec.clone();
+                    run_spec.payload["namespace"] =
+                        json!(namespace.try_get::<String, _>("namespace")?);
+                    let run_name = format!("{}-{}", name, Uuid::new_v4().simple());
+                    let run_id = self
+                        .submit_schedule_run(&tenant, &name, &run_spec, &run_name, now)
+                        .await?;
+                    triggered.push(run_id);
+                    last_run_id = Some(run_id);
+                }
+            } else {
+                let run_name = format!("{}-{}", name, Uuid::new_v4().simple());
+                let run_id = self
+                    .submit_schedule_run(&tenant, &name, &spec, &run_name, now)
+                    .await?;
+                triggered.push(run_id);
+                last_run_id = Some(run_id);
+            }
             let next_trigger = next_trigger_time(&spec, now + chrono::Duration::seconds(1))?;
             db::query(
                 "UPDATE schedules SET last_triggered_at = ?, next_trigger_at = ?, last_run_id = ?, updated_at = ? WHERE tenant = ? AND name = ?",
             )
             .bind(now.to_rfc3339())
             .bind(next_trigger.map(|value| value.to_rfc3339()))
-            .bind(run_id.to_string())
+            .bind(last_run_id.map(|run_id| run_id.to_string()))
             .bind(now.to_rfc3339())
             .bind(&tenant)
             .bind(&name)
             .execute(&self.pool)
             .await?;
-            triggered.push(run_id);
         }
         Ok(triggered)
     }
@@ -2776,12 +2807,17 @@ impl AgentdStore {
         run_name: &str,
         now: DateTime<Utc>,
     ) -> Result<Uuid> {
-        let input = json!({
+        let mut input = json!({
             "activation": "schedule",
             "schedule_name": schedule_name,
             "input": spec.payload,
             "triggered_at": now.to_rfc3339(),
         });
+        if spec.agent_ref == MEMORY_MAINTAINER_AGENT {
+            if let Some(namespace) = spec.payload.get("namespace") {
+                input["namespace"] = namespace.clone();
+            }
+        }
         let run_id = self
             .submit_run(NewRun {
                 tenant,
@@ -4108,6 +4144,79 @@ mod tests {
         assert_eq!(ids.last().map(String::as_str), Some("fact-104"));
         assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(!ids.iter().any(|id| id == "secret"));
+    }
+
+    #[tokio::test]
+    async fn maintenance_schedule_fans_out_to_populated_tenant_namespaces() {
+        let (_dir, store) = store().await;
+        tenant_with_agent(&store, "one").await;
+        tenant_with_agent(&store, "two").await;
+        let bot = store.get_agent("one", "bot").await.unwrap().unwrap();
+        let mut metadata = bot.metadata;
+        metadata.name = MEMORY_MAINTAINER_AGENT.into();
+        let mut spec = bot.spec;
+        spec.allowed_families = Some(vec![ToolFamily::Memory]);
+        spec.context_window = Some(0);
+        store
+            .apply_agent(&AgentResource { metadata, spec })
+            .await
+            .unwrap();
+
+        let now = Utc::now();
+        store
+            .put_schedule(
+                "one",
+                MEMORY_MAINTENANCE_SCHEDULE,
+                &ScheduleSpec {
+                    agent_ref: MEMORY_MAINTAINER_AGENT.into(),
+                    scope: "memory-maintenance/default".into(),
+                    payload: json!({"namespace":ALL_MEMORY_NAMESPACES}),
+                    delivery: None,
+                    at: Some(now + ChronoDuration::minutes(1)),
+                    cron: None,
+                    timezone: None,
+                    enabled: true,
+                },
+            )
+            .await
+            .unwrap();
+        let embedding = test_embedding(0);
+        for namespace in ["bot", "default", "shared", MEMORY_MAINTAINER_AGENT] {
+            store
+                .put_memory("one", namespace, "fact", "tenant one fact", &embedding)
+                .await
+                .unwrap();
+        }
+        store
+            .put_memory("two", "other", "fact", "tenant two fact", &embedding)
+            .await
+            .unwrap();
+        db::query("UPDATE schedules SET next_trigger_at = ? WHERE tenant = ? AND name = ?")
+            .bind((now - ChronoDuration::seconds(1)).to_rfc3339())
+            .bind("one")
+            .bind(MEMORY_MAINTENANCE_SCHEDULE)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        let run_ids = store.trigger_due_schedules(now, 32).await.unwrap();
+        assert_eq!(run_ids.len(), 3);
+        let mut namespaces = Vec::new();
+        for run_id in run_ids {
+            let run = store.get_run(run_id).await.unwrap().unwrap();
+            assert_eq!(run.tenant, "one");
+            assert_eq!(run.agent_ref, MEMORY_MAINTAINER_AGENT);
+            assert_eq!(run.input["activation"], "schedule");
+            assert_eq!(run.input["namespace"], run.input["input"]["namespace"]);
+            namespaces.push(
+                run.input["input"]["namespace"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+        namespaces.sort();
+        assert_eq!(namespaces, vec!["bot", "default", "shared"]);
     }
 
     #[tokio::test]
