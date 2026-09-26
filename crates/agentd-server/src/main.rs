@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 
+mod audit;
 mod auth;
 mod config;
 mod dispatch;

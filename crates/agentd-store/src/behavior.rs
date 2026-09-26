@@ -144,10 +144,6 @@ impl AgentdStore {
         .fetch_optional(&self.pool)
         .await?
         .unwrap_or(0);
-        if pending != 0 {
-            readiness.reason = "already_pending";
-            return Ok(readiness);
-        }
         // Match list_behavior_source_runs and the core's bounded source scan,
         // projecting only scope to avoid loading potentially large run inputs.
         let rows = db::query(
@@ -172,7 +168,9 @@ impl AgentdStore {
             .collect::<std::result::Result<BTreeSet<_>, _>>()?;
         readiness.source_runs = rows.len();
         readiness.independent_scopes = scopes.len();
-        readiness.reason = if readiness.source_runs < options.min_samples {
+        readiness.reason = if pending != 0 {
+            "already_pending"
+        } else if readiness.source_runs < options.min_samples {
             "insufficient_samples"
         } else if readiness.independent_scopes < 2 {
             "insufficient_independent_scopes"
@@ -259,8 +257,24 @@ impl AgentdStore {
 
     /// Disable the active supplement while keeping the complete audit history.
     pub async fn clear_behavior_policy(&self, tenant: &str, agent: &str) -> Result<bool> {
-        Ok(db::query("UPDATE behavior_heads SET active_revision = NULL WHERE tenant = ? AND agent_ref = ? AND active_revision IS NOT NULL")
-            .bind(tenant).bind(agent).execute(&self.pool).await?.rows_affected() > 0)
+        let mut tx = self.pool.begin().await?;
+        let previous_revision = db::query_scalar::<Option<i64>>(
+            "SELECT active_revision FROM behavior_heads WHERE tenant = ? AND agent_ref = ?",
+        )
+        .bind(tenant)
+        .bind(agent)
+        .fetch_optional(&mut tx)
+        .await?
+        .flatten();
+        let cleared = db::query("UPDATE behavior_heads SET active_revision = NULL WHERE tenant = ? AND agent_ref = ? AND active_revision IS NOT NULL")
+            .bind(tenant).bind(agent).execute(&mut tx).await?.rows_affected() > 0;
+        audit::record(&mut tx, AuditInput::new(
+            Some(tenant), "behavior.clear", "behavior_policy", Some(agent),
+            if cleared { "succeeded" } else { "noop" },
+            json!({"target_agent":agent,"previous_revision":previous_revision,"cleared":cleared}),
+        )).await?;
+        tx.commit().await?;
+        Ok(cleared)
     }
 
     /// Atomically publish the candidate, consume its source cursor, and finish
@@ -314,12 +328,17 @@ impl AgentdStore {
         let target = db::query("SELECT metadata_json, spec_json, created_at, updated_at FROM agents WHERE tenant = ? AND name = ?")
             .bind(&tenant).bind(result.target_agent).fetch_optional(&mut tx).await?.map(row_to_agent).transpose()?;
         let head = db::query(
-            "SELECT active_revision FROM behavior_heads WHERE tenant = ? AND agent_ref = ?",
+            "SELECT active_revision, source_run_id FROM behavior_heads WHERE tenant = ? AND agent_ref = ?",
         )
         .bind(&tenant)
         .bind(result.target_agent)
         .fetch_optional(&mut tx)
         .await?;
+        let previous_source_run_id = head
+            .as_ref()
+            .map(|row| row.try_get::<Option<String>, _>("source_run_id"))
+            .transpose()?
+            .flatten();
         let active = head
             .map(|row| row.try_get::<Option<i64>, _>("active_revision"))
             .transpose()?
@@ -348,6 +367,7 @@ impl AgentdStore {
             .bind(&tenant).bind(result.target_agent).bind(revision).bind(result.expected_revision.map(|n| n as i64))
             .bind(serde_json::to_string(result.expected_spec)?).bind(result.instructions).bind(outcome)
             .bind(run_id.to_string()).bind(result.report.to_string()).bind(now.to_rfc3339()).execute(&mut tx).await?;
+        let mut source_cursor_changed = false;
         if !stale {
             db::query("INSERT INTO behavior_heads (tenant, agent_ref) VALUES (?, ?) ON CONFLICT(tenant, agent_ref) DO NOTHING")
                 .bind(&tenant).bind(result.target_agent).execute(&mut tx).await?;
@@ -356,11 +376,11 @@ impl AgentdStore {
                     .bind(revision).bind(&tenant).bind(result.target_agent).execute(&mut tx).await?;
             }
             // A concurrent rejected cycle must not move consumption backwards.
-            db::query("UPDATE behavior_heads SET source_updated_at = ?, source_run_id = ? WHERE tenant = ? AND agent_ref = ? AND (source_updated_at IS NULL OR source_updated_at < ? OR (source_updated_at = ? AND source_run_id < ?))")
+            source_cursor_changed = db::query("UPDATE behavior_heads SET source_updated_at = ?, source_run_id = ? WHERE tenant = ? AND agent_ref = ? AND (source_updated_at IS NULL OR source_updated_at < ? OR (source_updated_at = ? AND source_run_id < ?))")
                 .bind(result.source_updated_at.to_rfc3339()).bind(result.source_run_id.to_string())
                 .bind(&tenant).bind(result.target_agent).bind(result.source_updated_at.to_rfc3339())
                 .bind(result.source_updated_at.to_rfc3339()).bind(result.source_run_id.to_string())
-                .execute(&mut tx).await?;
+                .execute(&mut tx).await?.rows_affected() > 0;
         }
         let output = json!({"status":outcome,"outcome":outcome,"target_agent":result.target_agent,"revision":revision,"report":result.report});
         let changed = db::query("UPDATE runs SET output_json = ?, error = NULL, status = 'succeeded', updated_at = ? WHERE run_id = ? AND status = 'running'")
@@ -372,14 +392,29 @@ impl AgentdStore {
             ("output", output),
             ("status", json!({"status":"succeeded"})),
         ] {
-            db::query("INSERT INTO run_log (run_id, kind, payload_json, ts) VALUES (?, ?, ?, ?)")
-                .bind(run_id.to_string())
-                .bind(kind)
-                .bind(payload.to_string())
-                .bind(now.to_rfc3339())
-                .execute(&mut tx)
+            Self::append_run_trace(&mut tx, &tenant, run_id, kind, &payload, &now.to_rfc3339())
                 .await?;
         }
+        audit::record(&mut tx, AuditInput::new(
+            Some(&tenant), "behavior.finish", "behavior_policy", Some(result.target_agent), outcome,
+            json!({
+                "target_agent":result.target_agent,"revision":revision,
+                "parent_revision":result.expected_revision,"previous_revision":active,
+                "source_run_id":result.source_run_id,"source_cursor_advanced":source_cursor_changed,
+                "source_count":result.report.get("source_runs").and_then(serde_json::Value::as_array).map(Vec::len),
+                "evaluation_count":result.report.get("evaluations").and_then(serde_json::Value::as_array).map(Vec::len),
+            }),
+        ).for_run(run_id)).await?;
+        if source_cursor_changed {
+            audit::record(&mut tx, AuditInput::new(
+                Some(&tenant), "behavior.source_cursor", "behavior_policy", Some(result.target_agent), "advanced",
+                json!({"target_agent":result.target_agent,"previous_source_run_id":previous_source_run_id,"source_run_id":result.source_run_id}),
+            ).for_run(run_id)).await?;
+        }
+        audit::record(&mut tx, AuditInput::new(
+            Some(&tenant), "run.succeed", "run", Some(&run_id.to_string()), "succeeded",
+            json!({"status_before":"running","status_after":"succeeded","learning_outcome":outcome}),
+        ).for_run(run_id)).await?;
         tx.commit().await?;
         Ok(BehaviorRevision {
             tenant,
@@ -1447,7 +1482,7 @@ mod tests {
                 .fetch_optional(&migrated.pool)
                 .await
                 .unwrap(),
-            Some(10)
+            Some(11)
         );
         assert!(migrated
             .get_memory("one", "bot", "fact")

@@ -1,9 +1,9 @@
 # Deployment
 
-agentd normally treats runtime data as replaceable. Schema v10 supports in-place
-migration from versions 6–9, preserving runtime data while adding the required
+agentd normally treats runtime data as replaceable. Schema v11 supports in-place
+migration from versions 6–10, preserving runtime data while adding the required
 graph, immutable delivery payload, behavior-learning state, and memory-maintenance
-revision checkpoints. Back up the
+revision checkpoints and audit history. Back up the
 data directory before starting the new version against an existing database.
 Existing populated memory namespaces receive an initial unconsumed revision
 during migration, so those meeting the entry threshold can receive one
@@ -35,7 +35,14 @@ also includes both model licenses beside their assets and the repository's
 8. Verify the local and remote services and the Telegram decoy page.
 9. Delete the rollback data only after the checks pass.
 
-If startup reports a schema mismatch outside the supported v6–v9 migrations,
+Supported v6–v10 databases migrate in place to v11; back up the existing database
+and restart against the same path for those upgrades. The empty-path procedure
+above is for a deliberate data reset. Audit starts at migration, includes reads
+and polling, has no automatic pruning, and survives tenant deletion. Monitor
+database growth and include audit data in backups; `--reset-data` removes it.
+See [audit history](audit.md) for coverage and operational limits.
+
+If startup reports a schema mismatch outside the supported v6–v10 migrations,
 use `agentd --reset-data`; do not add an ad hoc ALTER, backfill, repair endpoint,
 or legacy parser.
 

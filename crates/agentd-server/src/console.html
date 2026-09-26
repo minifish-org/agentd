@@ -7,8 +7,14 @@
   <style>
     :root { color-scheme: dark; font: 14px/1.45 system-ui, sans-serif; background: #0b0d10; color: #e7e9ec; }
     * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
     body { margin: 0; }
-    header, .filters { display: flex; align-items: end; gap: 12px; padding: 14px 20px; border-bottom: 1px solid #2a2f36; }
+    header, .filters, .views { display: flex; align-items: end; gap: 12px; padding: 14px 20px; border-bottom: 1px solid #2a2f36; }
+    .filters { flex-wrap: wrap; }
+    .views { align-items: center; padding-block: 10px; }
+    .views button[aria-pressed="true"] { background: #243449; border-color: #6287b5; }
+    button:disabled { opacity: .5; cursor: default; }
+    #audit-filters input { width: 100%; min-width: 145px; }
     header { align-items: center; justify-content: space-between; background: #11151a; }
     h1, h2, h3 { margin: 0; }
     h1 { font-size: 20px; } h2 { font-size: 14px; } h3 { padding: 10px 12px; border-bottom: 1px solid #2a2f36; font-size: 12px; text-transform: uppercase; }
@@ -20,7 +26,8 @@
     main { display: grid; grid-template-columns: minmax(280px, 34%) minmax(0, 1fr); min-height: calc(100vh - 137px); }
     aside { border-right: 1px solid #2a2f36; }
     .heading { display: flex; justify-content: space-between; padding: 12px 14px; border-bottom: 1px solid #2a2f36; }
-    #runs { max-height: calc(100vh - 182px); overflow: auto; }
+    #runs, #audit-events { max-height: calc(100vh - 250px); overflow: auto; }
+    .pagination { padding: 12px 14px; }
     .run { display: grid; grid-template-columns: auto 1fr; gap: 7px 10px; width: 100%; padding: 12px 14px; border: 0; border-bottom: 1px solid #22272d; border-radius: 0; background: transparent; text-align: left; }
     .run:hover, .run.selected { background: #18202b; }
     .run-meta { grid-column: 1 / 3; overflow: hidden; color: #929ba6; font: 12px monospace; text-overflow: ellipsis; white-space: nowrap; }
@@ -32,19 +39,24 @@
     pre { max-height: 360px; margin: 0; padding: 12px; overflow: auto; font: 12px/1.5 ui-monospace, monospace; white-space: pre-wrap; word-break: break-word; }
     .empty { padding: 28px 16px; color: #929ba6; text-align: center; }
     .error { color: #ff9898; }
-    @media (max-width: 760px) { header { align-items: flex-start; flex-direction: column; } .auth, .auth input { width: 100%; } .filters { display: grid; grid-template-columns: 1fr 1fr; } main { grid-template-columns: 1fr; } aside { border: 0; } #runs { max-height: 320px; } }
+    @media (max-width: 760px) { header { align-items: flex-start; flex-direction: column; } .auth, .auth input { width: 100%; } .filters { display: grid; grid-template-columns: 1fr 1fr; } main { grid-template-columns: 1fr; } aside { border: 0; } #runs, #audit-events { max-height: 320px; } }
   </style>
 </head>
 <body>
   <header>
-    <div><h1>agentd <span class="muted">run history</span></h1><span class="muted">Read-only runtime observations</span></div>
+    <div><h1>agentd <span class="muted">history</span></h1><span class="muted">Read-only runs and audit events</span></div>
     <div class="auth">
       <input id="token" type="password" autocomplete="off" placeholder="API token, if configured" aria-label="API token">
       <button id="connect" type="button">Load history</button>
       <span id="connection" class="muted">Not loaded</span>
     </div>
   </header>
-  <div class="filters">
+  <nav class="views" aria-label="History view">
+    <button id="view-runs" type="button" aria-pressed="true">Runs</button>
+    <button id="view-audit" type="button" aria-pressed="false">Audit</button>
+    <span class="muted">Refresh to load newer records.</span>
+  </nav>
+  <div id="run-filters" class="filters">
     <label>Tenant<select id="tenant" disabled></select></label>
     <label>Agent<select id="agent" disabled></select></label>
     <label>Status<select id="status" disabled>
@@ -52,17 +64,43 @@
     </select></label>
     <button id="refresh" type="button" disabled>Refresh</button>
   </div>
-  <main>
+  <div id="audit-filters" class="filters" hidden>
+    <label>Tenant<input id="audit-tenant" list="audit-tenants" placeholder="All tenants, or type a deleted tenant" disabled></label>
+    <datalist id="audit-tenants"></datalist>
+    <label>Action<input id="audit-action" placeholder="All actions" disabled></label>
+    <label>Outcome<input id="audit-outcome" list="audit-outcomes" placeholder="All outcomes" disabled></label>
+    <datalist id="audit-outcomes"><option value="started"><option value="succeeded"><option value="failed"><option value="rejected"><option value="skipped"><option value="noop"><option value="promoted"><option value="stale"><option value="completed"><option value="partial"></datalist>
+    <label>Request ID<input id="audit-request-id" placeholder="Any request" disabled></label>
+    <label>Run ID<input id="audit-run-id" placeholder="Any run" disabled></label>
+    <button id="audit-refresh" type="button" disabled>Refresh</button>
+  </div>
+  <main id="run-view">
     <aside><div class="heading"><h2>Runs</h2><span id="count" class="muted">0</span></div><div id="runs" class="empty">Load history to view runs.</div></aside>
     <article>
-      <div class="panel"><h3>Run</h3><pre id="run">Select a run.</pre></div>
+      <div class="panel"><div class="heading"><h2>Run</h2><button id="run-audit" type="button" disabled>View audit</button></div><pre id="run">Select a run.</pre></div>
       <div class="panel"><h3>Raw trace</h3><pre id="trace">[]</pre></div>
       <div class="panel"><h3>Delivery</h3><pre id="delivery">[]</pre></div>
     </article>
   </main>
+  <main id="audit-view" hidden>
+    <aside>
+      <div class="heading"><h2>Audit events · newest first</h2><span id="audit-count" class="muted">0</span></div>
+      <div id="audit-events" class="empty">Load history to view audit events.</div>
+      <div class="pagination"><button id="audit-more" type="button" hidden disabled>More</button><p id="audit-message" class="muted"></p></div>
+    </aside>
+    <article>
+      <div class="panel"><h3>Event</h3><pre id="audit-event">Select an audit event.</pre></div>
+      <div class="panel"><h3>Details</h3><pre id="audit-details">{}</pre></div>
+    </article>
+  </main>
   <script>
     const $ = id => document.getElementById(id);
-    const state = { token: sessionStorage.getItem('agentd.console.token') || '', tenant: '', runId: '', runs: [], generation: 0 };
+    const auditFilterIds = ['audit-tenant', 'audit-action', 'audit-outcome', 'audit-request-id', 'audit-run-id'];
+    const state = {
+      token: sessionStorage.getItem('agentd.console.token') || '', tenant: '', runId: '', runs: [], generation: 0,
+      view: 'runs', connected: false, connectionGeneration: 0,
+      auditEvents: [], auditId: null, auditBefore: null, auditGeneration: 0, auditLoading: false, auditFilterKey: '',
+    };
     $('token').value = state.token;
 
     async function request(path) {
@@ -88,24 +126,68 @@
     function showError(error) {
       $('connection').textContent = error.message;
       $('connection').className = 'error';
-      $('runs').className = 'empty error';
-      $('runs').textContent = error.message;
+      if (state.view === 'audit') {
+        $('audit-message').textContent = error.message;
+        $('audit-message').className = 'error';
+      } else {
+        $('runs').className = 'empty error';
+        $('runs').textContent = error.message;
+      }
+    }
+
+    function connectedMessage() {
+      $('connection').textContent = 'Connected';
+      $('connection').className = 'muted';
+    }
+
+    function controls() {
+      for (const id of ['tenant', 'agent', 'status', 'refresh']) $(id).disabled = !state.connected || !state.tenant;
+      for (const id of auditFilterIds) $(id).disabled = !state.connected;
+      $('audit-refresh').disabled = !state.connected || state.auditLoading;
+      $('audit-more').disabled = !state.connected || state.auditLoading || state.auditBefore === null;
+      $('audit-more').hidden = state.auditBefore === null;
+    }
+
+    function showView(view) {
+      state.view = view;
+      ++state.generation;
+      ++state.auditGeneration;
+      state.auditLoading = false;
+      $('run-view').hidden = $('run-filters').hidden = view !== 'runs';
+      $('audit-view').hidden = $('audit-filters').hidden = view !== 'audit';
+      $('view-runs').setAttribute('aria-pressed', String(view === 'runs'));
+      $('view-audit').setAttribute('aria-pressed', String(view === 'audit'));
+      controls();
+      if (!state.connected) return;
+      if (view === 'audit') return loadAudit();
+      if (state.tenant) return loadTenant();
+      emptyRuns('No tenants found.');
     }
 
     async function connect() {
+      const generation = ++state.connectionGeneration;
+      ++state.generation;
+      ++state.auditGeneration;
+      state.connected = false;
+      state.auditLoading = false;
+      controls();
       state.token = $('token').value.trim();
       state.token ? sessionStorage.setItem('agentd.console.token', state.token) : sessionStorage.removeItem('agentd.console.token');
       try {
         const body = await request('/v1/tenants');
+        if (generation !== state.connectionGeneration) return;
         const tenants = Array.isArray(body?.tenants) ? body.tenants : [];
         options($('tenant'), tenants);
-        state.tenant = tenants[0] || '';
-        for (const id of ['tenant', 'agent', 'status', 'refresh']) $(id).disabled = !state.tenant;
-        $('connection').textContent = 'Connected';
-        $('connection').className = 'muted';
-        if (state.tenant) await loadTenant();
+        options($('audit-tenants'), tenants);
+        state.tenant = tenants.includes(state.tenant) ? state.tenant : tenants[0] || '';
+        $('tenant').value = state.tenant;
+        state.connected = true;
+        controls();
+        connectedMessage();
+        if (state.view === 'audit') await loadAudit();
+        else if (state.tenant) await loadTenant();
         else emptyRuns('No tenants found.');
-      } catch (error) { showError(error); }
+      } catch (error) { if (generation === state.connectionGeneration) showError(error); }
     }
 
     async function loadTenant() {
@@ -119,6 +201,7 @@
     }
 
     async function loadRuns(generation = ++state.generation) {
+      if (!state.connected || !state.tenant || state.view !== 'runs') return;
       const query = new URLSearchParams({ limit: '100' });
       if ($('agent').value) query.set('agent_ref', $('agent').value);
       if ($('status').value) query.set('status', $('status').value);
@@ -126,6 +209,7 @@
         const runs = await request(`/v1/tenants/${encodeURIComponent(state.tenant)}/runs?${query}`);
         if (generation !== state.generation) return;
         state.runs = Array.isArray(runs) ? runs : [];
+        connectedMessage();
         renderRuns();
         const selected = state.runs.find(run => run.run_id === state.runId) || state.runs[0];
         selected ? await loadRun(selected.run_id, generation) : clearDetail();
@@ -165,6 +249,7 @@
 
     async function loadRun(runId, generation) {
       state.runId = runId;
+      $('run-audit').disabled = false;
       renderRuns();
       const root = `/v1/tenants/${encodeURIComponent(state.tenant)}`;
       try {
@@ -184,9 +269,108 @@
 
     function clearDetail() {
       state.runId = '';
+      $('run-audit').disabled = true;
       $('run').textContent = 'Select a run.';
       $('trace').textContent = '[]';
       $('delivery').textContent = '[]';
+    }
+
+    function clearAuditDetail() {
+      state.auditId = null;
+      $('audit-event').textContent = 'Select an audit event.';
+      $('audit-details').textContent = '{}';
+    }
+
+    function renderAudit() {
+      $('audit-count').textContent = String(state.auditEvents.length);
+      if (!state.auditEvents.length) {
+        $('audit-events').className = 'empty';
+        $('audit-events').textContent = state.auditLoading ? 'Loading audit events…' : 'No audit events match these filters.';
+        clearAuditDetail();
+        return;
+      }
+      const buttons = state.auditEvents.map(event => {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = `run${event.id === state.auditId ? ' selected' : ''}`;
+        const badge = document.createElement('span');
+        badge.className = 'status';
+        badge.textContent = event.outcome;
+        const action = document.createElement('strong');
+        action.textContent = event.action;
+        const meta = document.createElement('span');
+        meta.className = 'run-meta';
+        meta.textContent = `#${event.id} · ${event.tenant ?? 'Global'} · ${event.actor_kind}/${event.actor_id} · ${new Date(event.ts).toLocaleString()}`;
+        button.append(badge, action, meta);
+        button.onclick = () => selectAudit(event.id);
+        return button;
+      });
+      $('audit-events').className = '';
+      $('audit-events').replaceChildren(...buttons);
+    }
+
+    function selectAudit(id) {
+      const event = state.auditEvents.find(event => event.id === id);
+      if (!event) return clearAuditDetail();
+      state.auditId = id;
+      const { details, ...metadata } = event;
+      $('audit-event').textContent = JSON.stringify(metadata, null, 2);
+      $('audit-details').textContent = JSON.stringify(details, null, 2);
+      renderAudit();
+    }
+
+    async function loadAudit(more = false) {
+      if (!state.connected || state.view !== 'audit') return;
+      const filters = auditFilterIds.map(id => $(id).value.trim());
+      const filterKey = JSON.stringify(filters);
+      // Changing filters while a page is loading invalidates that old request.
+      // More always continues the exact same filter set as the displayed page.
+      if (more && filterKey !== state.auditFilterKey) return loadAudit();
+      if (more && (state.auditLoading || state.auditBefore === null)) return;
+      const generation = ++state.auditGeneration;
+      const before = more ? state.auditBefore : null;
+      if (!more) {
+        state.auditEvents = [];
+        state.auditBefore = null;
+        clearAuditDetail();
+      }
+      state.auditFilterKey = filterKey;
+      state.auditLoading = true;
+      $('audit-message').textContent = '';
+      $('audit-message').className = 'muted';
+      controls();
+      renderAudit();
+      const [tenant, action, outcome, requestId, runId] = filters;
+      const query = new URLSearchParams({ limit: '50' });
+      for (const [key, value] of [['action', action], ['outcome', outcome], ['request_id', requestId], ['run_id', runId]]) {
+        if (value) query.set(key, value);
+      }
+      if (before !== null) query.set('before_id', String(before));
+      const root = tenant ? `/v1/tenants/${encodeURIComponent(tenant)}/audit` : '/v1/audit';
+      try {
+        const page = await request(`${root}?${query}`);
+        if (generation !== state.auditGeneration) return;
+        if (!Array.isArray(page?.events)) throw new Error('Invalid audit response');
+        const seen = new Set(state.auditEvents.map(event => event.id));
+        state.auditEvents.push(...page.events.filter(event => !seen.has(event.id)));
+        state.auditBefore = Number.isSafeInteger(page.next_before_id) ? page.next_before_id : null;
+        state.auditLoading = false;
+        renderAudit();
+        if (state.auditEvents.length) selectAudit(state.auditId ?? state.auditEvents[0].id);
+        $('audit-message').textContent = state.auditBefore === null ? 'No more events. Refresh to load newer records.' : 'More loads older events.';
+        connectedMessage();
+      } catch (error) {
+        if (generation === state.auditGeneration) {
+          state.auditLoading = false;
+          renderAudit();
+          showError(error);
+        }
+      } finally {
+        if (generation === state.auditGeneration) {
+          state.auditLoading = false;
+          controls();
+        }
+      }
     }
 
     $('connect').onclick = connect;
@@ -194,6 +378,21 @@
     $('tenant').onchange = () => { state.tenant = $('tenant').value; state.runId = ''; loadTenant(); };
     $('agent').onchange = $('status').onchange = () => { state.runId = ''; loadRuns(); };
     $('refresh').onclick = () => loadRuns();
+    $('view-runs').onclick = () => showView('runs');
+    $('view-audit').onclick = () => showView('audit');
+    $('audit-refresh').onclick = () => loadAudit();
+    $('audit-more').onclick = () => loadAudit(true);
+    for (const id of auditFilterIds) {
+      $(id).onchange = () => loadAudit();
+      $(id).onkeydown = event => { if (event.key === 'Enter') loadAudit(); };
+    }
+    $('run-audit').onclick = () => {
+      if (!state.runId) return;
+      $('audit-tenant').value = state.tenant;
+      $('audit-run-id').value = state.runId;
+      for (const id of ['audit-action', 'audit-outcome', 'audit-request-id']) $(id).value = '';
+      showView('audit');
+    };
     connect();
   </script>
 </body>

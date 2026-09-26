@@ -13,7 +13,7 @@ REST turn / due schedule
   context → model ⇄ allowed built-in/MCP/sandbox tools
           |
           v
- transaction: output + terminal trace + context + optional delivery reference
+ transaction: output + terminal trace + context + optional delivery + audit
 ```
 
 ## Boundaries
@@ -33,7 +33,8 @@ REST turn / due schedule
 - An enabled `sandbox_session` lazily assigns one microsandbox microVM to a run.
   The run ID is the internal lifecycle key; models see only `exec` and `shell`.
   Guest files persist between calls in that run and are destroyed at every
-  terminal path. Sandbox metadata is not stored in agentd's database.
+  terminal path. Live sandbox handles stay in memory; cleanup/reaping outcomes
+  and run tool evidence are audited in the database.
 
 ## Repeated-failure detection
 
@@ -54,8 +55,8 @@ in cross-run conversation history.
 
 ## Persistence
 
-The schema is versioned. Startup creates v10 for an empty database and migrates
-versions 6–9 in place; unknown versions request `--reset-data`.
+The schema is versioned. Startup creates v11 for an empty database and migrates
+versions 6–10 in place; unknown versions request `--reset-data`.
 
 Important facts are stored once. Runs own activation, final output, and an
 optional requested destination; `run_log` owns model/tool/output/status/error
@@ -63,6 +64,15 @@ observations; contexts own recent messages; deliveries reference runs and own
 only remote delivery state and retry fields. There are no
 activation, receipt, worker, step, side-effect, token, lease, RAG metadata, or
 replay tables.
+
+`audit_events` owns cross-resource access, mutation and scheduling history.
+Each business mutation writes its audit record in the same transaction;
+task-local actor/request/run identity follows the operation without entering
+agent context. HTTP starts precede handlers and completions follow response
+creation. Due scheduling decisions are recorded even without a run. Audit rows
+have no tenant foreign key, survive tenant deletion, and reject UPDATE/DELETE.
+They hold safe summaries and references to raw trace rows; they do not copy
+model/tool content. See [audit history](audit.md) for query and failure semantics.
 
 Canonical memory remains one logical table. Its text and fixed 384-dimension
 little-endian f32 embedding share the same row; one FTS5 index follows the text

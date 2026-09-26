@@ -347,6 +347,14 @@ impl RuntimeEngine {
 
     async fn skip_learning(&self, run_id: Uuid, reason: &str, details: Value) -> Result<()> {
         self.store
+            .append_event(
+                run_id,
+                "behavior_check",
+                json!({"ready":false,"reason":reason,"details":details}),
+                Utc::now(),
+            )
+            .await?;
+        self.store
             .finalize_run_success(
                 run_id,
                 &json!({"status":"skipped","reason":reason,"details":details}),
@@ -395,10 +403,21 @@ impl RuntimeEngine {
                 Utc::now(),
             )
             .await?;
-        let response =
-            tokio::time::timeout_at(budget.deadline, self.caps.chat_completion(&request))
-                .await
-                .map_err(|_| anyhow!("behavior-learning deadline exceeded"))??;
+        let result = tokio::time::timeout_at(budget.deadline, self.caps.chat_completion(&request))
+            .await
+            .map_err(|_| anyhow!("behavior-learning deadline exceeded"))
+            .and_then(|result| result);
+        let response = match result {
+            Ok(response) => response,
+            Err(error) => {
+                self.store.append_event(
+                    run_id, "model",
+                    json!({"phase":"error","stage":stage,"step":budget.used,"reason":"model_request_failed"}),
+                    Utc::now(),
+                ).await?;
+                return Err(error);
+            }
+        };
         self.store
             .append_event(
                 run_id,

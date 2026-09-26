@@ -34,11 +34,17 @@ Loopback without a token is intended only for a trusted local workstation.
 - API bearer token;
 - user prompts, model outputs, tool arguments/results, and raw run traces;
 - context, memory, artifacts, schedules, deliveries, and MCP configuration;
-- host filesystem, network identity, CPU, memory, and child-process authority.
+- host filesystem, network identity, CPU, memory, and child-process authority;
+- durable audit history, resource identifiers and access metadata.
 
 The libSQL database stores application data in plaintext. Raw traces and
 provider/tool payloads may contain sensitive content even when secret values
-are not deliberately persisted.
+are not deliberately persisted. The separate [audit index](audit.md) retains
+identifiers and safe structural summaries, excludes payloads and credentials,
+and audits API reads as well as writes. It is append-only within the application,
+not tamper-proof against the trusted database/host administrator. Tenant deletion
+preserves audit history; a data reset does not. API identity remains a shared
+token identity, not personal attribution.
 
 ## Trust boundaries
 
@@ -84,9 +90,10 @@ so network and host-level resource controls remain necessary.
 
 `memory_list` is bounded to one namespace and 100 items per call. Its cursor is
 validated against the current run's tenant and namespace, and list responses
-exclude embeddings and internal database identifiers. The optional maintenance
-preset installs a memory-only agent and a disabled schedule; it does not grant
-cross-tenant access or start model calls until an operator enables the schedule.
+exclude embeddings and internal database identifiers. Automatic maintenance
+provisions a memory-only agent and an enabled schedule; it does not grant
+cross-tenant access. Entry/change gates suppress unnecessary model calls, and
+explicitly disabled schedules remain disabled. Skipped due work is audited.
 The reserved maintainer is pinned to `standard/chat`; its native loop binds
 memory calls to the run's input namespace, blocks mutations until enumeration is
 complete, and rejects a final response if any `memory_list` page remains unread.

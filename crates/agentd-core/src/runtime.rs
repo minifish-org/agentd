@@ -261,7 +261,12 @@ impl RuntimeEngine {
             scope: run.scope.clone(),
             deadline: Instant::now() + Duration::from_millis(assigned.timeout_ms.max(1)),
         };
-        match self.run_agent(assigned, &context).await {
+        match agentd_store::with_audit_context(
+            agentd_store::AuditContext::agent(&run.agent_ref, run.run_id),
+            self.run_agent(assigned, &context),
+        )
+        .await
+        {
             Ok(()) => Ok(ExecutionReport { error: None }),
             Err(error) => Ok(ExecutionReport {
                 error: Some(error.to_string()),
@@ -358,7 +363,18 @@ impl RuntimeEngine {
                     Utc::now(),
                 )
                 .await?;
-            let response = self.caps.chat_completion(&request).await?;
+            let response =
+                match self.caps.chat_completion(&request).await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        self.store.append_event(
+                        run.run_id, "model",
+                        json!({"phase":"error","step":step,"reason":"model_request_failed"}),
+                        Utc::now(),
+                    ).await?;
+                        return Err(error);
+                    }
+                };
             self.store
                 .append_event(
                     run.run_id,
@@ -1272,6 +1288,30 @@ mod tests {
                 .map(|item| item.kind.as_str())
                 .collect::<Vec<_>>(),
             ["model", "model", "output", "status"]
+        );
+        let audit = store
+            .list_audit_events(&agentd_store::AuditQuery {
+                run_id: Some(run_id),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .events;
+        for event in audit.iter().filter(|event| {
+            matches!(
+                event.action.as_str(),
+                "run.trace" | "run.succeed" | "context.put" | "delivery.enqueue"
+            )
+        }) {
+            assert_eq!(event.actor_kind, "agent");
+            assert_eq!(event.actor_id, "bot");
+        }
+        assert_eq!(
+            audit
+                .iter()
+                .filter(|event| event.action == "run.trace")
+                .count(),
+            trace.len()
         );
         assert_eq!(
             store

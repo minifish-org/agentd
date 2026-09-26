@@ -18,6 +18,10 @@ not preserved unless a release note explicitly says otherwise.
 
 ### Added
 
+- Durable append-only audit history for API access/rejection, resource changes,
+  run/trace/delivery lifecycle, background scheduling decisions and policy or
+  memory-maintenance state. Request/run correlation and global/tenant paginated
+  query APIs include history of deleted tenants without duplicating payloads.
 - Per-tenant behavior learning with an enabled weekly schedule,
   isolated offline next-decision comparisons, independent AI judging, and
   automatic promotion of learned instruction supplements after held-out
@@ -55,8 +59,8 @@ not preserved unless a release note explicitly says otherwise.
   normalization repairs malformed multiline or serialized delivery objects
   before they can enter rolling context or reach a transport.
 - Delivery rows now capture an immutable payload at terminal commit time;
-  schema versions 6–9 migrate in place to schema version 10, which also adds
-  behavior-learning state and memory-maintenance revision checkpoints.
+  schema versions 6–10 migrate in place to schema version 11, which also adds
+  behavior-learning state, memory-maintenance checkpoints and audit history.
 - The example `simple-bot` keeps ten complete context turns and allows 180
   seconds for tool-heavy runs.
 

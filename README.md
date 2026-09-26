@@ -6,12 +6,12 @@
 
 agentd is an experimental, multi-tenant, single-agent runtime for one host. The
 model decides; agentd supplies a native model/tool loop, capability boundaries,
-persistence, scheduling, per-scope serialization, raw traces, and one pull
+persistence, scheduling, per-scope serialization, audit history, raw traces, and one pull
 delivery outbox.
 
 Database and HTTP compatibility are intentionally narrow. Runtime data remains
-disposable, but schema versions 6–9 migrate in place to v10, preserving existing
-runtime data and adding background-maintenance state. Other schema mismatches
+disposable, but schema versions 6–10 migrate in place to v11, preserving existing
+runtime data and adding background-maintenance state and audit history. Other schema mismatches
 require `--reset-data`.
 
 ## Runtime shape
@@ -44,6 +44,12 @@ and lexical ranks are combined with RRF; its top 10 are reranked to a final top
 the same libSQL database. Stored `run_log` rows remain the canonical trace.
 Optional behavior learning evaluates frozen historical decision inputs without
 executing tools.
+
+Append-only [audit history](docs/audit.md) records API access, committed resource
+changes, run/delivery lifecycle and background decisions, including skipped
+work that creates no run. Query `/v1/audit` or `/v1/tenants/:tenant/audit` and
+follow the response `X-Request-Id` or run ID across events. Audit records survive
+tenant deletion and contain structural summaries rather than execution content.
 
 ## Start
 
@@ -99,9 +105,11 @@ the host. Before submitting a real turn, edit the provider fields and replace
 the development token. Send `Authorization: Bearer local-dev-token` to `/v1/*`
 for the unchanged local example.
 
-The browser console at `/` is read-only. It lists tenants, agents, and runs,
-then shows the selected run, raw trace, and delivery state. An API token entered
-there stays in the browser tab.
+The browser console at `/` is read-only. Runs shows tenants, agents, runs,
+raw traces and delivery state. Audit shows event history with tenant/action/
+outcome/request/run filters and cursor pagination, including deleted tenants.
+A selected run can open its related audit records. An API token entered there
+stays in the browser tab.
 
 ## Create a tenant and agent
 

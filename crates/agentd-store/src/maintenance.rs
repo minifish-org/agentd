@@ -89,6 +89,9 @@ async fn readiness(
         ),
         None => (0, 0),
     };
+    if external_revision < 0 || consumed_revision < 0 || consumed_revision > external_revision {
+        return Err(anyhow!("invalid memory maintenance revision state"));
+    }
     let reason = if entries < min_entries {
         Some("too_few_entries".into())
     } else if external_revision <= consumed_revision {
@@ -148,7 +151,7 @@ impl AgentdStore {
         let namespace = maintenance_namespace(&input)?;
         let state = readiness(&mut tx, &tenant, &namespace, min_entries).await?;
         if state.ready {
-            db::query(
+            let inserted = db::query(
                 "INSERT OR IGNORE INTO memory_maintenance_runs (run_id, tenant, namespace, start_revision) VALUES (?, ?, ?, ?)",
             )
             .bind(run_id.to_string())
@@ -156,7 +159,13 @@ impl AgentdStore {
             .bind(&namespace)
             .bind(state.external_revision)
             .execute(&mut tx)
-            .await?;
+            .await?.rows_affected() > 0;
+            if inserted {
+                audit::record(&mut tx, AuditInput::new(
+                    Some(&tenant), "memory_maintenance.prepare", "memory_namespace", Some(&namespace), "prepared",
+                    json!({"namespace":namespace,"entries":state.entries,"min_entries":min_entries,"start_revision":state.external_revision}),
+                ).for_run(run_id)).await?;
+            }
         }
         tx.commit().await?;
         Ok(state)
@@ -231,6 +240,30 @@ pub(super) async fn record_memory_change(
     .bind(namespace)
     .execute(&mut *tx)
     .await?;
+    let revision = db::query_scalar::<i64>(
+        "SELECT external_revision FROM memory_maintenance_state WHERE tenant = ? AND namespace = ?",
+    )
+    .bind(tenant)
+    .bind(namespace)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| anyhow!("memory maintenance revision missing after change"))?;
+    let previous_revision = revision
+        .checked_sub(1)
+        .filter(|revision| *revision >= 0)
+        .ok_or_else(|| anyhow!("invalid memory maintenance revision after change"))?;
+    let mut input = AuditInput::new(
+        Some(tenant),
+        "memory_maintenance.external_change",
+        "memory_namespace",
+        Some(namespace),
+        "advanced",
+        json!({"namespace":namespace,"previous_revision":previous_revision,"external_revision":revision}),
+    );
+    if let Some(run_id) = source_run_id {
+        input = input.for_run(run_id);
+    }
+    audit::record(tx, input).await?;
     Ok(())
 }
 
@@ -238,8 +271,10 @@ pub(super) async fn record_memory_change(
 /// cannot acknowledge memory changes, and writes after prepare remain pending.
 pub(super) async fn checkpoint_success(tx: &mut db::Transaction, run_id: Uuid) -> Result<()> {
     let row = db::query(
-        "SELECT m.tenant, m.namespace, m.start_revision, r.agent_ref, r.status
+        "SELECT m.tenant, m.namespace, m.start_revision, r.agent_ref, r.status,
+                s.consumed_revision, s.external_revision
          FROM memory_maintenance_runs m JOIN runs r ON r.run_id = m.run_id AND r.tenant = m.tenant
+         JOIN memory_maintenance_state s ON s.tenant = m.tenant AND s.namespace = m.namespace
          WHERE m.run_id = ?",
     )
     .bind(run_id.to_string())
@@ -256,15 +291,34 @@ pub(super) async fn checkpoint_success(tx: &mut db::Transaction, run_id: Uuid) -
             "only successful memory maintenance can consume external changes"
         ));
     }
+    let tenant = row.try_get::<String, _>("tenant")?;
+    let namespace = row.try_get::<String, _>("namespace")?;
+    let start_revision = row.try_get::<i64, _>("start_revision")?;
+    let previous_consumed = row.try_get::<i64, _>("consumed_revision")?;
+    let external_revision = row.try_get::<i64, _>("external_revision")?;
+    if start_revision < 0
+        || previous_consumed < 0
+        || start_revision > external_revision
+        || previous_consumed > external_revision
+    {
+        return Err(anyhow!("invalid memory maintenance checkpoint revisions"));
+    }
+    let consumed_revision = previous_consumed.max(start_revision);
     db::query(
         "UPDATE memory_maintenance_state SET consumed_revision = MAX(consumed_revision, ?)
          WHERE tenant = ? AND namespace = ?",
     )
-    .bind(row.try_get::<i64, _>("start_revision")?)
-    .bind(row.try_get::<String, _>("tenant")?)
-    .bind(row.try_get::<String, _>("namespace")?)
+    .bind(start_revision)
+    .bind(&tenant)
+    .bind(&namespace)
     .execute(&mut *tx)
     .await?;
+    audit::record(tx, AuditInput::new(
+        Some(&tenant), "memory_maintenance.checkpoint", "memory_namespace", Some(&namespace),
+        if consumed_revision > previous_consumed { "consumed" } else { "unchanged" },
+        json!({"namespace":namespace,"start_revision":start_revision,"previous_consumed_revision":previous_consumed,
+            "consumed_revision":consumed_revision,"external_revision":external_revision}),
+    ).for_run(run_id)).await?;
     Ok(())
 }
 
@@ -799,7 +853,7 @@ mod tests {
                 .fetch_optional(&migrated.pool)
                 .await
                 .unwrap(),
-            Some(10)
+            Some(11)
         );
     }
 }

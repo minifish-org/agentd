@@ -1,7 +1,8 @@
 # HTTP API
 
-All resources use tenant paths. Tenant identity never comes from a body or
-query parameter.
+Business resources use tenant paths. Tenant identity never comes from a body or
+query parameter. The operator audit API additionally supports an instance-wide
+history query with an optional tenant filter.
 
 | Area | Endpoints |
 | --- | --- |
@@ -18,6 +19,12 @@ query parameter.
 | Tool | `GET .../tools` |
 | MCP | list and `GET/PUT/DELETE .../mcp/:name` |
 | Delivery | list, `POST .../deliveries/claim`, and `POST .../:id/ack` |
+| Audit | `GET /v1/audit`, `GET .../audit`; filter by action, outcome, resource, actor, request or run, with bounded cursor pages |
+
+All `/v1` access, including reads and rejected requests, is audited. Responses
+include a server-generated `X-Request-Id` linking request and mutation records.
+Audit query, identity, privacy, failure and retention semantics are documented
+in [audit history](audit.md). Auditing does not require or create agent runs.
 
 Turn input:
 
@@ -137,6 +144,8 @@ namespace is excluded from wildcard discovery, and a queued/running pass for
 the same namespace prevents another scheduled run.
 
 Ineligible work causes no run or model call, but the schedule advances normally.
+Its `schedule.decision` audit records the reason and readiness counts; an empty
+target set records `no_targets`. Schedule advancement has a separate summary.
 For a fan-out trigger, `last_run_id` identifies the last queued run; use the runs
 list to see all namespace runs. A trigger that queues nothing preserves the
 previous `last_run_id`. Reapplying the preset repairs the reserved agent's model

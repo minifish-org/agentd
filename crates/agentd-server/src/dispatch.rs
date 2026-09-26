@@ -5,6 +5,14 @@ use chrono::Utc;
 use std::{sync::atomic::Ordering, time::Duration};
 
 pub(crate) async fn run_local_dispatch_loop(state: AppState) {
+    agentd_store::with_audit_context(
+        agentd_store::AuditContext::system("dispatcher"),
+        dispatch_loop(state),
+    )
+    .await
+}
+
+async fn dispatch_loop(state: AppState) {
     let mut interval =
         tokio::time::interval(Duration::from_millis(state.dispatch_poll_interval_ms));
     loop {
@@ -35,11 +43,16 @@ pub(crate) async fn run_local_dispatch_loop(state: AppState) {
                 if start_rx.await.is_err() {
                     return;
                 }
-                let execution = execute_local_run_if_running(task_state.clone(), assigned).await;
-                if let Err(error) = execution {
-                    tracing::error!(run_id = %run_id, error = %error, "local run execution failed");
-                    let _ = task_state.store.fail_run(run_id, &error.to_string()).await;
-                }
+                agentd_store::with_audit_context(
+                    agentd_store::AuditContext::system("dispatcher"),
+                    async {
+                        let execution = execute_local_run_if_running(task_state.clone(), assigned).await;
+                        if let Err(error) = execution {
+                            tracing::error!(run_id = %run_id, error = %error, "local run execution failed");
+                            let _ = task_state.store.fail_run(run_id, &error.to_string()).await;
+                        }
+                    },
+                ).await;
                 task_state.running_tasks.lock().await.remove(&run_id);
             });
             let mut running_tasks = state.running_tasks.lock().await;

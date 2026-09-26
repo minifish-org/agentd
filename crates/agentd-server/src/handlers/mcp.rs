@@ -49,7 +49,7 @@ pub(crate) async fn put_mcp_server(
         created_at: now,
         updated_at: now,
     };
-    let tools = match tools_for_put(&candidate).await {
+    let tools = match audited_tools_for_put(&state.store, &candidate).await {
         Ok(tools) => tools,
         Err(error) => return error_response(error),
     };
@@ -98,7 +98,7 @@ pub(crate) async fn rediscover_enabled_servers(state: &AppState) {
         }
     };
     for server in servers.into_iter().filter(|server| server.spec.enabled) {
-        match discover_allowed_tools(&server).await {
+        match audited_tools_for_put(&state.store, &server).await {
             Ok(tools) => {
                 if let Err(error) = state
                     .store
@@ -123,6 +123,35 @@ pub(crate) async fn rediscover_enabled_servers(state: &AppState) {
             }
         }
     }
+}
+
+async fn audited_tools_for_put(
+    store: &agentd_store::AgentdStore,
+    server: &McpServer,
+) -> anyhow::Result<Vec<McpTool>> {
+    if !server.spec.enabled {
+        return Ok(Vec::new());
+    }
+    let event = |outcome, details| {
+        agentd_store::AuditInput::new(
+            Some(&server.tenant),
+            "mcp.discover",
+            "mcp_server",
+            Some(&server.name),
+            outcome,
+            details,
+        )
+    };
+    store
+        .append_audit(event("started", serde_json::json!({})))
+        .await?;
+    let result = tools_for_put(server).await;
+    let (outcome, details) = match &result {
+        Ok(tools) => ("succeeded", serde_json::json!({"tool_count":tools.len()})),
+        Err(_) => ("failed", serde_json::json!({"reason":"discovery_failed"})),
+    };
+    store.append_audit(event(outcome, details)).await?;
+    result
 }
 
 async fn discover_allowed_tools(server: &McpServer) -> anyhow::Result<Vec<McpTool>> {

@@ -26,10 +26,11 @@ impl Scheduler {
     }
 
     pub async fn run_once(&self) -> Result<()> {
-        let triggered = self
-            .store
-            .trigger_due_schedules(chrono::Utc::now(), 32)
-            .await?;
+        let triggered = agentd_store::with_audit_context(
+            agentd_store::AuditContext::system("scheduler"),
+            self.store.trigger_due_schedules(chrono::Utc::now(), 32),
+        )
+        .await?;
         if !triggered.is_empty() {
             info!(count = triggered.len(), "due schedules triggered");
         }

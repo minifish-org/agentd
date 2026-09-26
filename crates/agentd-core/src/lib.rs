@@ -2,6 +2,7 @@ use agentd_api::{McpToolInvocationTarget, ToolFamily, ToolSpec};
 use agentd_store::AgentdStore;
 use anyhow::{anyhow, Result};
 use serde::Serialize;
+use serde_json::json;
 use std::time::Duration;
 
 mod behavior;
@@ -181,7 +182,33 @@ impl CapabilityEngine {
 
     pub async fn cleanup_sandbox_run(&self, run_id: uuid::Uuid) {
         if let Some(manager) = &self.sandbox {
-            if let Err(error) = manager.destroy_run(run_id).await {
+            let tenant = self
+                .store
+                .get_run(run_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|run| run.tenant);
+            self.audit_sandbox_cleanup(
+                tenant.as_deref(),
+                Some(run_id),
+                "sandbox.cleanup",
+                "started",
+            )
+            .await;
+            let result = manager.destroy_run(run_id).await;
+            self.audit_sandbox_cleanup(
+                tenant.as_deref(),
+                Some(run_id),
+                "sandbox.cleanup",
+                if result.is_ok() {
+                    "succeeded"
+                } else {
+                    "failed"
+                },
+            )
+            .await;
+            if let Err(error) = result {
                 tracing::warn!(run_id = %run_id, error = %error, "sandbox cleanup failed");
             }
         }
@@ -189,7 +216,21 @@ impl CapabilityEngine {
 
     pub async fn cleanup_all_sandboxes(&self) {
         if let Some(manager) = &self.sandbox {
-            if let Err(error) = manager.destroy_all().await {
+            self.audit_sandbox_cleanup(None, None, "sandbox.cleanup_all", "started")
+                .await;
+            let result = manager.destroy_all().await;
+            self.audit_sandbox_cleanup(
+                None,
+                None,
+                "sandbox.cleanup_all",
+                if result.is_ok() {
+                    "succeeded"
+                } else {
+                    "failed"
+                },
+            )
+            .await;
+            if let Err(error) = result {
                 tracing::warn!(error = %error, "sandbox shutdown cleanup failed");
             }
         }
@@ -197,8 +238,64 @@ impl CapabilityEngine {
 
     pub async fn reap_sandbox_orphans(&self) -> Result<usize> {
         match &self.sandbox {
-            Some(manager) => manager.reap_orphans().await,
+            Some(manager) => {
+                self.store
+                    .append_audit(agentd_store::AuditInput::new(
+                        None,
+                        "sandbox.reap",
+                        "sandbox",
+                        None,
+                        "started",
+                        json!({}),
+                    ))
+                    .await?;
+                let result = manager.reap_orphans().await;
+                let (outcome, details) = match &result {
+                    Ok(count) => ("succeeded", json!({"reaped":count})),
+                    Err(_) => ("failed", json!({"reason":"reap_failed"})),
+                };
+                self.store
+                    .append_audit(agentd_store::AuditInput::new(
+                        None,
+                        "sandbox.reap",
+                        "sandbox",
+                        None,
+                        outcome,
+                        details,
+                    ))
+                    .await?;
+                result
+            }
             None => Ok(0),
+        }
+    }
+
+    // Cancellation and shutdown must still release sandbox resources when the
+    // database is unavailable. Report audit failures to the service log.
+    async fn audit_sandbox_cleanup(
+        &self,
+        tenant: Option<&str>,
+        run_id: Option<uuid::Uuid>,
+        action: &str,
+        outcome: &str,
+    ) {
+        let id = run_id.map(|id| id.to_string());
+        let mut event = agentd_store::AuditInput::new(
+            tenant,
+            action,
+            "sandbox",
+            id.as_deref(),
+            outcome,
+            json!({}),
+        );
+        event.run_id = run_id;
+        if self.store.append_audit(event).await.is_err() {
+            tracing::error!(
+                ?run_id,
+                action,
+                outcome,
+                "sandbox cleanup audit could not be persisted"
+            );
         }
     }
 

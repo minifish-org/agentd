@@ -1,3 +1,4 @@
+use crate::audit::{audit_request, HttpAuditState};
 use crate::auth::require_api_token;
 use crate::config::Config;
 use crate::dispatch::run_local_dispatch_loop;
@@ -6,6 +7,7 @@ use crate::handlers::agents::{
     patch_tenant, put_agent,
 };
 use crate::handlers::artifact::{delete_artifact, list_artifacts, read_artifact, write_artifact};
+use crate::handlers::audit::{list_audit, list_tenant_audit};
 use crate::handlers::behavior::{clear_behavior_learning, get_behavior_learning};
 use crate::handlers::context::{delete_context, get_context, list_context_scopes};
 use crate::handlers::delivery_outbox::{ack_delivery, claim_deliveries, list_deliveries};
@@ -24,7 +26,7 @@ use crate::handlers::turns::submit_turn_endpoint;
 use crate::scheduler::Scheduler;
 use crate::state::AppState;
 use agentd_core::{CapabilityEngine, CapabilityEngineConfig, RuntimeEngine};
-use agentd_store::AgentdStore;
+use agentd_store::{with_audit_context, AgentdStore, AuditContext, AuditInput};
 use anyhow::{Context, Result};
 use axum::{
     middleware,
@@ -34,6 +36,7 @@ use axum::{
 };
 use std::{
     collections::HashMap,
+    net::SocketAddr,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -72,7 +75,20 @@ pub(crate) async fn run_server(config_path: &str, reset_data: bool) -> Result<()
     }
 
     let store = AgentdStore::new(&cfg.database_path).await?;
-    store.reset_local_runtime_state().await?;
+    with_audit_context(AuditContext::system("startup"), async {
+        store
+            .append_audit(AuditInput::new(
+                None,
+                "server.startup",
+                "server",
+                None,
+                "started",
+                serde_json::json!({"reset_data":reset_data}),
+            ))
+            .await?;
+        store.reset_local_runtime_state().await
+    })
+    .await?;
     bootstrap_background_presets(&store).await?;
     let sandbox_manager = match cfg.sandbox_runtime_config()? {
         Some(config) => Some(
@@ -94,7 +110,8 @@ pub(crate) async fn run_server(config_path: &str, reset_data: bool) -> Result<()
     );
     if let Some(manager) = sandbox_manager {
         caps = caps.with_sandbox_manager(manager);
-        match caps.reap_sandbox_orphans().await {
+        match with_audit_context(AuditContext::system("startup"), caps.reap_sandbox_orphans()).await
+        {
             Ok(reaped) if reaped > 0 => {
                 tracing::info!(count = reaped, "removed orphaned sandbox sessions");
             }
@@ -111,7 +128,7 @@ pub(crate) async fn run_server(config_path: &str, reset_data: bool) -> Result<()
         store.clone(),
         Duration::from_millis(cfg.scheduler_tick_ms.max(100)),
     );
-    tokio::spawn(scheduler.run_forever());
+    let scheduler_task = tokio::spawn(scheduler.run_forever());
 
     let app_state = AppState {
         store: store.clone(),
@@ -123,39 +140,70 @@ pub(crate) async fn run_server(config_path: &str, reset_data: bool) -> Result<()
         shutting_down: Arc::new(AtomicBool::new(false)),
     };
 
-    rediscover_enabled_servers(&app_state).await;
+    with_audit_context(
+        AuditContext::system("mcp_discovery"),
+        rediscover_enabled_servers(&app_state),
+    )
+    .await;
     tokio::spawn(run_local_dispatch_loop(app_state.clone()));
 
     let router = build_router(app_state.clone(), cfg.api_token.clone());
 
+    let listener = tokio::net::TcpListener::bind(rest_listener).await?;
+    with_audit_context(
+        AuditContext::system("startup"),
+        store.append_audit(AuditInput::new(
+            None,
+            "server.startup",
+            "server",
+            None,
+            "succeeded",
+            serde_json::json!({}),
+        )),
+    )
+    .await?;
     let shutdown_state = app_state.clone();
-    let rest = axum::serve(tokio::net::TcpListener::bind(rest_listener).await?, router)
-        .with_graceful_shutdown(async move {
-            shutdown_signal().await;
-            shutdown_local_runtime(&shutdown_state).await;
-        });
+    let rest = axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        scheduler_task.abort();
+        let _ = scheduler_task.await;
+        shutdown_local_runtime(&shutdown_state).await;
+    });
     info!(rest = %cfg.rest_addr, "agentd single-host runtime listening");
     let result = rest.await;
-    app_state.capabilities.cleanup_all_sandboxes().await;
+    with_audit_context(
+        AuditContext::system("shutdown"),
+        app_state.capabilities.cleanup_all_sandboxes(),
+    )
+    .await;
     result?;
     Ok(())
 }
 
 async fn bootstrap_background_presets(store: &AgentdStore) -> Result<()> {
+    with_audit_context(AuditContext::system("bootstrap"), async {
     for tenant in store.list_tenants().await? {
         let results = [
-            ensure_memory_maintenance(store, &tenant).await,
-            ensure_behavior_learning(
+            ("memory-maintenance", ensure_memory_maintenance(store, &tenant).await),
+            ("behavior-learning", ensure_behavior_learning(
                 store,
                 &tenant,
                 &agentd_api::BehaviorLearningOptions::default(),
             )
-            .await,
+            .await),
         ];
-        for result in results {
+        for (preset, result) in results {
             match result {
                 Ok(_) => {}
                 Err(error) if error.is_conflict() => {
+                    store.append_audit(AuditInput::new(
+                        Some(&tenant), "preset.install", "preset", Some(preset), "rejected",
+                        serde_json::json!({"reason":"reserved_resource_conflict"}),
+                    )).await?;
                     tracing::warn!(tenant, error = %error, "background preset conflicts with an existing reserved resource; preserving it");
                 }
                 Err(error) => {
@@ -167,22 +215,56 @@ async fn bootstrap_background_presets(store: &AgentdStore) -> Result<()> {
         }
     }
     Ok(())
+    }).await
 }
 
 async fn shutdown_local_runtime(state: &AppState) {
-    state.shutting_down.store(true, Ordering::SeqCst);
-    let handles: Vec<_> = state
-        .running_tasks
-        .lock()
-        .await
-        .drain()
-        .map(|(_, task)| task)
-        .collect();
-    for handle in handles {
-        handle.abort();
-        let _ = handle.await;
-    }
-    state.capabilities.cleanup_all_sandboxes().await;
+    with_audit_context(AuditContext::system("shutdown"), async {
+        state.shutting_down.store(true, Ordering::SeqCst);
+        let handles: Vec<_> = state
+            .running_tasks
+            .lock()
+            .await
+            .drain()
+            .map(|(_, task)| task)
+            .collect();
+        if state
+            .store
+            .append_audit(AuditInput::new(
+                None,
+                "server.shutdown",
+                "server",
+                None,
+                "started",
+                serde_json::json!({"active_runs":handles.len()}),
+            ))
+            .await
+            .is_err()
+        {
+            tracing::error!("server shutdown start audit could not be persisted");
+        }
+        for handle in handles {
+            handle.abort();
+            let _ = handle.await;
+        }
+        state.capabilities.cleanup_all_sandboxes().await;
+        if state
+            .store
+            .append_audit(AuditInput::new(
+                None,
+                "server.shutdown",
+                "server",
+                None,
+                "succeeded",
+                serde_json::json!({}),
+            ))
+            .await
+            .is_err()
+        {
+            tracing::error!("server shutdown completion audit could not be persisted");
+        }
+    })
+    .await;
 }
 
 async fn shutdown_signal() {
@@ -203,9 +285,12 @@ async fn shutdown_signal() {
 }
 
 pub(crate) fn build_router(app_state: AppState, api_token: Option<String>) -> Router {
+    let audit_state = HttpAuditState::new(app_state.store.clone(), api_token.clone());
     Router::new()
         .route("/", get(console))
         .route("/console", get(console))
+        .route("/v1/audit", get(list_audit))
+        .route("/v1/tenants/:tenant/audit", get(list_tenant_audit))
         .route("/v1/tenants", get(list_tenants).post(create_tenant))
         .route(
             "/v1/tenants/:name",
@@ -274,10 +359,16 @@ pub(crate) fn build_router(app_state: AppState, api_token: Option<String>) -> Ro
         // Artifact bodies may be large media payloads.
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         .layer(middleware::from_fn_with_state(api_token, require_api_token))
-        .layer(tower_http::cors::CorsLayer::permissive())
+        .layer(
+            tower_http::cors::CorsLayer::permissive()
+                .expose_headers([axum::http::HeaderName::from_static("x-request-id")]),
+        )
+        // Outermost so authentication errors, extractor rejections, CORS
+        // preflight, method mismatches and fallback responses are all audited.
+        .layer(middleware::from_fn_with_state(audit_state, audit_request))
 }
 
-/// Read-only browser for runs, raw traces, and deliveries.
+/// Read-only browser for runs, raw traces, deliveries, and audit history.
 async fn console() -> Html<&'static str> {
     Html(include_str!("console.html"))
 }

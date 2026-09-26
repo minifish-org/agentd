@@ -25,6 +25,15 @@ use db::{LibsqlPool, Row};
 
 mod behavior;
 pub use behavior::{BehaviorLearningReadiness, BehaviorLearningResult, BehaviorSnapshot};
+pub mod audit;
+pub use audit::{with_audit_context, AuditContext, AuditEvent, AuditInput, AuditPage, AuditQuery};
+mod audit_mutations;
+#[cfg(test)]
+mod audit_resource_tests;
+#[cfg(test)]
+mod audit_run_tests;
+#[cfg(test)]
+mod audit_scheduler_tests;
 mod maintenance;
 pub use maintenance::{memory_maintenance_min_entries, MemoryMaintenanceReadiness};
 
@@ -829,7 +838,7 @@ impl AgentdStore {
             pool,
             mcp_apply_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
-        store.initialize_schema().await?;
+        with_audit_context(AuditContext::system("schema"), store.initialize_schema()).await?;
         Ok(store)
     }
 
@@ -845,6 +854,7 @@ impl AgentdStore {
         let name = normalize_tenant_name(name)?;
         let now = Utc::now().to_rfc3339();
         let metadata_json = serde_json::to_string(metadata)?;
+        let mut tx = self.pool.begin().await?;
         let result = db::query(
             "INSERT OR IGNORE INTO tenants (name, metadata_json, created_at, updated_at) \
              VALUES (?, ?, ?, ?)",
@@ -853,9 +863,22 @@ impl AgentdStore {
         .bind(&metadata_json)
         .bind(&now)
         .bind(&now)
-        .execute(&self.pool)
+        .execute(&mut tx)
         .await?;
         let created = result.rows_affected() > 0;
+        audit::record(
+            &mut tx,
+            AuditInput::new(
+                Some(&name),
+                "tenant.create",
+                "tenant",
+                Some(&name),
+                audit_mutations::outcome(created),
+                json!({"created":created,"metadata_bytes":metadata_json.len()}),
+            ),
+        )
+        .await?;
+        tx.commit().await?;
         let record = self
             .get_tenant(&name)
             .await?
@@ -887,12 +910,46 @@ impl AgentdStore {
         if_updated_at: Option<&str>,
     ) -> Result<TenantMetadataPatchResult> {
         let name = normalize_tenant_name(name)?;
-        let current = self.get_tenant(&name).await?;
+        let mut tx = self.pool.begin().await?;
+        let current = db::query(
+            "SELECT name, metadata_json, created_at, updated_at FROM tenants WHERE name = ?",
+        )
+        .bind(&name)
+        .fetch_optional(&mut tx)
+        .await?
+        .map(row_to_tenant_record)
+        .transpose()?;
         let Some(current) = current else {
+            audit::record(
+                &mut tx,
+                AuditInput::new(
+                    Some(&name),
+                    "tenant.metadata",
+                    "tenant",
+                    Some(&name),
+                    "not_found",
+                    json!({}),
+                ),
+            )
+            .await?;
+            tx.commit().await?;
             return Ok(TenantMetadataPatchResult::NotFound);
         };
         if let Some(expected) = if_updated_at {
             if current.updated_at != expected {
+                audit::record(
+                    &mut tx,
+                    AuditInput::new(
+                        Some(&name),
+                        "tenant.metadata",
+                        "tenant",
+                        Some(&name),
+                        "rejected",
+                        json!({"reason":"version_conflict"}),
+                    ),
+                )
+                .await?;
+                tx.commit().await?;
                 return Ok(TenantMetadataPatchResult::Conflict(current));
             }
         }
@@ -900,22 +957,40 @@ impl AgentdStore {
         let now = Utc::now().to_rfc3339();
         let metadata_json = serde_json::to_string(metadata)?;
         let changed =
-            db::query("UPDATE tenants SET metadata_json = ?, updated_at = ? WHERE name = ?")
+            db::query("UPDATE tenants SET metadata_json = ?, updated_at = ? WHERE name = ? AND updated_at = ?")
                 .bind(&metadata_json)
                 .bind(&now)
                 .bind(&name)
-                .execute(&self.pool)
+                .bind(&current.updated_at)
+                .execute(&mut tx)
                 .await?
                 .rows_affected();
 
         if changed == 0 {
+            audit::record(
+                &mut tx,
+                AuditInput::new(
+                    Some(&name),
+                    "tenant.metadata",
+                    "tenant",
+                    Some(&name),
+                    "not_found",
+                    json!({}),
+                ),
+            )
+            .await?;
+            tx.commit().await?;
             return Ok(TenantMetadataPatchResult::NotFound);
         }
 
-        let updated = self
-            .get_tenant(&name)
-            .await?
-            .ok_or_else(|| anyhow!("tenant was not readable after metadata patch: {name}"))?;
+        audit::record(&mut tx, AuditInput::new(Some(&name), "tenant.metadata", "tenant", Some(&name), "succeeded", json!({"changed":current.metadata != *metadata,"metadata_bytes":metadata_json.len()}))).await?;
+        tx.commit().await?;
+        let updated = TenantRecord {
+            name,
+            metadata: metadata.clone(),
+            created_at: current.created_at,
+            updated_at: now,
+        };
         Ok(TenantMetadataPatchResult::Updated(updated))
     }
 
@@ -975,16 +1050,30 @@ impl AgentdStore {
         agent: &str,
         scope: &str,
     ) -> Result<bool> {
-        Ok(
+        let mut tx = self.pool.begin().await?;
+        let changed =
             db::query("DELETE FROM contexts WHERE tenant = ? AND agent = ? AND scope = ?")
                 .bind(tenant)
                 .bind(agent)
                 .bind(scope)
-                .execute(&self.pool)
+                .execute(&mut tx)
                 .await?
                 .rows_affected()
-                > 0,
+                > 0;
+        audit::record(
+            &mut tx,
+            AuditInput::new(
+                Some(tenant),
+                "context.delete",
+                "context",
+                Some(agent),
+                audit_mutations::outcome(changed),
+                json!({"scope":scope,"deleted":changed}),
+            ),
         )
+        .await?;
+        tx.commit().await?;
+        Ok(changed)
     }
 
     pub async fn get_memory(
@@ -1186,13 +1275,16 @@ impl AgentdStore {
             .get_run(run_id)
             .await?
             .ok_or_else(|| anyhow!("memory writer run not found"))?;
-        self.put_memory_with_source(
-            (&run.tenant, Some(run_id)),
-            namespace,
-            id,
-            text,
-            embedding,
-            graph,
+        with_audit_context(
+            AuditContext::agent(&run.agent_ref, run_id),
+            self.put_memory_with_source(
+                (&run.tenant, Some(run_id)),
+                namespace,
+                id,
+                text,
+                embedding,
+                graph,
+            ),
         )
         .await
     }
@@ -1304,6 +1396,16 @@ impl AgentdStore {
             content_changed,
         )
         .await?;
+        let mut event = AuditInput::new(
+            Some(tenant),
+            "memory.put",
+            "memory",
+            Some(&id),
+            "succeeded",
+            json!({"namespace":namespace,"created":previous_text.is_none(),"text_changed":content_changed,"text_bytes":text.len(),"graph_entities":graph.entities.len(),"graph_edges":graph.edges.len()}),
+        );
+        event.run_id = source_run_id;
+        audit::record(&mut tx, event).await?;
         tx.commit().await?;
         self.get_memory(tenant, &namespace, &id)
             .await?
@@ -1325,8 +1427,11 @@ impl AgentdStore {
             .get_run(run_id)
             .await?
             .ok_or_else(|| anyhow!("memory writer run not found"))?;
-        self.delete_memory_with_source(&run.tenant, namespace, id, Some(run_id))
-            .await
+        with_audit_context(
+            AuditContext::agent(&run.agent_ref, run_id),
+            self.delete_memory_with_source(&run.tenant, namespace, id, Some(run_id)),
+        )
+        .await
     }
 
     async fn delete_memory_with_source(
@@ -1348,6 +1453,16 @@ impl AgentdStore {
             .rows_affected();
         maintenance::record_memory_change(&mut tx, tenant, &namespace, source_run_id, deleted > 0)
             .await?;
+        let mut event = AuditInput::new(
+            Some(tenant),
+            "memory.delete",
+            "memory",
+            Some(&id),
+            audit_mutations::outcome(deleted > 0),
+            json!({"namespace":namespace,"deleted":deleted > 0}),
+        );
+        event.run_id = source_run_id;
+        audit::record(&mut tx, event).await?;
         tx.commit().await?;
         Ok(deleted > 0)
     }
@@ -1522,7 +1637,7 @@ impl AgentdStore {
     }
 
     async fn initialize_schema(&self) -> Result<()> {
-        const SCHEMA_VERSION: i64 = 10;
+        const SCHEMA_VERSION: i64 = 11;
         const GRAPH_MIGRATION_SCHEMA_VERSION: i64 = 6;
         const DELIVERY_PAYLOAD_SCHEMA_VERSION: i64 = 7;
         let version = db::query_scalar::<i64>("PRAGMA user_version")
@@ -1534,6 +1649,7 @@ impl AgentdStore {
             && version != DELIVERY_PAYLOAD_SCHEMA_VERSION
             && version != 8
             && version != 9
+            && version != 10
             && version != SCHEMA_VERSION
         {
             return Err(anyhow!(
@@ -1720,17 +1836,32 @@ impl AgentdStore {
             "CREATE INDEX idx_edges_incoming ON edges(tenant, namespace, target_entity_id, relation)",
         ];
         if version == 0 {
+            let mut tx = self.pool.begin().await?;
             for statement in statements
                 .into_iter()
                 .chain(graph_statements)
                 .chain(behavior::SCHEMA_STATEMENTS)
                 .chain(maintenance::SCHEMA_STATEMENTS)
+                .chain(audit::SCHEMA_STATEMENTS)
             {
-                db::query(statement).execute(&self.pool).await?;
+                db::query(statement).execute(&mut tx).await?;
             }
-            db::query("PRAGMA user_version = 10")
-                .execute(&self.pool)
+            db::query("PRAGMA user_version = 11")
+                .execute(&mut tx)
                 .await?;
+            audit::record(
+                &mut tx,
+                AuditInput::new(
+                    None,
+                    "schema.initialize",
+                    "database",
+                    None,
+                    "succeeded",
+                    json!({"from_version":0,"to_version":11}),
+                ),
+            )
+            .await?;
+            tx.commit().await?;
         } else if version < SCHEMA_VERSION {
             let mut tx = self.pool.begin().await?;
             if version == GRAPH_MIGRATION_SCHEMA_VERSION {
@@ -1754,10 +1885,25 @@ impl AgentdStore {
             for statement in behavior::SCHEMA_STATEMENTS {
                 db::query(statement).execute(&mut tx).await?;
             }
-            for statement in maintenance::SCHEMA_STATEMENTS {
+            for statement in maintenance::SCHEMA_STATEMENTS
+                .into_iter()
+                .chain(audit::SCHEMA_STATEMENTS)
+            {
                 db::query(statement).execute(&mut tx).await?;
             }
-            db::query("PRAGMA user_version = 10")
+            audit::record(
+                &mut tx,
+                AuditInput::new(
+                    None,
+                    "schema.migrate",
+                    "database",
+                    None,
+                    "succeeded",
+                    json!({"from_version":version,"to_version":11}),
+                ),
+            )
+            .await?;
+            db::query("PRAGMA user_version = 11")
                 .execute(&mut tx)
                 .await?;
             tx.commit().await?;
@@ -1778,10 +1924,13 @@ impl AgentdStore {
         .bind(&agent.metadata.name)
         .fetch_optional(&mut tx)
         .await?;
+        let previous_spec = previous_spec
+            .as_deref()
+            .map(serde_json::from_str::<agentd_api::AgentSpec>)
+            .transpose()?;
         let spec_changed = previous_spec
-            .map(|raw| serde_json::from_str::<agentd_api::AgentSpec>(&raw))
-            .transpose()?
-            .is_some_and(|previous| previous != agent.spec);
+            .as_ref()
+            .is_some_and(|previous| *previous != agent.spec);
         if spec_changed
             || agent.metadata.name.starts_with("system/")
             || agent
@@ -1790,11 +1939,24 @@ impl AgentdStore {
                 .get("agentd.system")
                 .is_some_and(|value| value == "true")
         {
-            db::query("UPDATE behavior_heads SET active_revision = NULL WHERE tenant = ? AND agent_ref = ?")
+            let invalidated = db::query("UPDATE behavior_heads SET active_revision = NULL WHERE tenant = ? AND agent_ref = ? AND active_revision IS NOT NULL")
                 .bind(&agent.metadata.tenant)
                 .bind(&agent.metadata.name)
-                .execute(&mut tx)
+                .execute(&mut tx).await?.rows_affected();
+            if invalidated > 0 {
+                audit::record(
+                    &mut tx,
+                    AuditInput::new(
+                        Some(&agent.metadata.tenant),
+                        "behavior.invalidate",
+                        "agent",
+                        Some(&agent.metadata.name),
+                        "succeeded",
+                        json!({"reason":"agent_configuration_changed"}),
+                    ),
+                )
                 .await?;
+            }
         }
         db::query(
             r#"INSERT INTO agents (tenant, name, metadata_json, spec_json, created_at, updated_at)
@@ -1812,6 +1974,10 @@ impl AgentdStore {
         .bind(&now)
         .execute(&mut tx)
         .await?;
+        audit::record(&mut tx, AuditInput::new(Some(&agent.metadata.tenant), "agent.put", "agent", Some(&agent.metadata.name), "succeeded", json!({
+            "created":previous_spec.is_none(),"changed_fields":audit_mutations::agent_changed_fields(previous_spec.as_ref(),&agent.spec),
+            "before":previous_spec.as_ref().map(audit_mutations::agent_spec),"after":audit_mutations::agent_spec(&agent.spec),"label_count":agent.metadata.labels.len()
+        }))).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -1860,6 +2026,7 @@ impl AgentdStore {
         self.ensure_unique_mcp_tool_names(tenant, name, spec.enabled, tools)
             .await?;
         let now = Utc::now().to_rfc3339();
+        let mut tx = self.pool.begin().await?;
         db::query(
             r#"INSERT INTO mcp_servers (
                    tenant, name, spec_json, tools_json, last_error, created_at, updated_at
@@ -1877,8 +2044,10 @@ impl AgentdStore {
         .bind(last_error)
         .bind(&now)
         .bind(&now)
-        .execute(&self.pool)
+        .execute(&mut tx)
         .await?;
+        audit::record(&mut tx, AuditInput::new(Some(tenant), "mcp.put", "mcp_server", Some(name), "succeeded", json!({"enabled":spec.enabled,"tool_count":tools.len(),"discovery_failed":last_error.is_some()}))).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1919,13 +2088,27 @@ impl AgentdStore {
     }
 
     pub async fn delete_mcp_server(&self, tenant: &str, name: &str) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
         let deleted = db::query("DELETE FROM mcp_servers WHERE tenant = ? AND name = ?")
             .bind(tenant)
             .bind(name)
-            .execute(&self.pool)
+            .execute(&mut tx)
             .await?
             .rows_affected()
             > 0;
+        audit::record(
+            &mut tx,
+            AuditInput::new(
+                Some(tenant),
+                "mcp.delete",
+                "mcp_server",
+                Some(name),
+                audit_mutations::outcome(deleted),
+                json!({"deleted":deleted}),
+            ),
+        )
+        .await?;
+        tx.commit().await?;
         Ok(deleted)
     }
 
@@ -2055,6 +2238,16 @@ impl AgentdStore {
         if self.get_agent(tenant, &spec.agent_ref).await?.is_none() {
             return Err(anyhow!("unknown schedule agent: {}", spec.agent_ref));
         }
+        let mut tx = self.pool.begin().await?;
+        let previous = db::query_scalar::<String>(
+            "SELECT spec_json FROM schedules WHERE tenant = ? AND name = ?",
+        )
+        .bind(tenant)
+        .bind(name)
+        .fetch_optional(&mut tx)
+        .await?
+        .map(|raw| serde_json::from_str::<ScheduleSpec>(&raw))
+        .transpose()?;
         let now = Utc::now();
         let next_trigger_at = next_trigger_time(&spec, now)?;
         let now_s = now.to_rfc3339();
@@ -2074,8 +2267,14 @@ impl AgentdStore {
         .bind(next_trigger_at.map(|value| value.to_rfc3339()))
         .bind(&now_s)
         .bind(&now_s)
-        .execute(&self.pool)
+        .execute(&mut tx)
         .await?;
+        audit::record(&mut tx, AuditInput::new(Some(tenant), "schedule.put", "schedule", Some(name), "succeeded", json!({
+            "created":previous.is_none(),"enabled_before":previous.as_ref().map(|s|s.enabled),"enabled_after":spec.enabled,
+            "agent_ref":spec.agent_ref,"cron":spec.cron,"at":spec.at,"timezone":spec.timezone,
+            "payload_changed":previous.as_ref().is_none_or(|s|s.payload != spec.payload),"delivery_configured":spec.delivery.is_some(),"next_trigger_at":next_trigger_at
+        }))).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -2109,13 +2308,27 @@ impl AgentdStore {
     }
 
     pub async fn delete_schedule(&self, tenant: &str, name: &str) -> Result<serde_json::Value> {
+        let mut tx = self.pool.begin().await?;
         let deleted = db::query("DELETE FROM schedules WHERE tenant = ? AND name = ?")
             .bind(tenant)
             .bind(name)
-            .execute(&self.pool)
+            .execute(&mut tx)
             .await?
             .rows_affected()
             > 0;
+        audit::record(
+            &mut tx,
+            AuditInput::new(
+                Some(tenant),
+                "schedule.delete",
+                "schedule",
+                Some(name),
+                audit_mutations::outcome(deleted),
+                json!({"deleted":deleted}),
+            ),
+        )
+        .await?;
+        tx.commit().await?;
         Ok(json!({"deleted": deleted, "name": name}))
     }
 
@@ -2130,8 +2343,11 @@ impl AgentdStore {
             return Err(anyhow!("delivery destination is required"));
         }
         if let Some(request_id) = run.request_id {
-            if let Some(existing) = self.find_run_by_request_id(run.tenant, request_id).await? {
-                return Ok(existing.run_id);
+            if let Some(existing) = self
+                .audit_existing_run_request(run.tenant, request_id)
+                .await?
+            {
+                return Ok(existing);
             }
         }
         let background_scope = if run.agent_ref == MEMORY_MAINTAINER_AGENT {
@@ -2171,6 +2387,8 @@ impl AgentdStore {
         }
         let run_id = Uuid::new_v4();
         let now = Utc::now().to_rfc3339();
+        let input_json = serde_json::to_string(run.input)?;
+        let mut tx = self.pool.begin().await?;
         let result = db::query(
             r#"INSERT INTO runs (
                    run_id, tenant, name, agent_ref, scope, source, input_json,
@@ -2184,22 +2402,31 @@ impl AgentdStore {
         .bind(run.agent_ref)
         .bind(background_scope.as_deref().unwrap_or(run.scope))
         .bind(run.source)
-        .bind(serde_json::to_string(run.input)?)
+        .bind(&input_json)
         .bind(status_to_wire(AgentRunStatus::Queued))
         .bind(run.request_id)
         .bind(run.schedule_name)
         .bind(run.delivery_destination.map(str::trim))
         .bind(&now)
         .bind(&now)
-        .execute(&self.pool)
+        .execute(&mut tx)
         .await;
         match result {
-            Ok(_) => Ok(run_id),
-            Err(error) if run.request_id.is_some() => self
-                .find_run_by_request_id(run.tenant, run.request_id.unwrap())
-                .await?
-                .map(|run| run.run_id)
-                .ok_or_else(|| error.into()),
+            Ok(_) => {
+                audit::record(&mut tx, AuditInput::new(Some(run.tenant), "run.submit", "run", Some(&run_id.to_string()), "succeeded", json!({
+                    "status":"queued","agent_ref":run.agent_ref,"input_bytes":input_json.len(),
+                    "delivery_configured":run.delivery_destination.is_some(),"schedule_configured":run.schedule_name.is_some(),
+                    "idempotency_configured":run.request_id.is_some(),"reused":false
+                })).for_run(run_id)).await?;
+                tx.commit().await?;
+                Ok(run_id)
+            }
+            Err(error) if run.request_id.is_some() => {
+                tx.rollback().await?;
+                self.audit_existing_run_request(run.tenant, run.request_id.unwrap())
+                    .await?
+                    .ok_or_else(|| error.into())
+            }
             Err(error) => Err(error.into()),
         }
     }
@@ -2288,26 +2515,51 @@ impl AgentdStore {
             if claimed.len() >= limit.max(1) {
                 break;
             }
-            let delivery = row_to_delivery_outbox(row)?;
+            let delivery_id = parse_uuid_field(&row, "delivery_id")?;
+            let mut tx = self.pool.begin().await?;
+            let current =
+                db::query("SELECT * FROM deliveries WHERE delivery_id = ? AND tenant = ?")
+                    .bind(delivery_id.to_string())
+                    .bind(tenant)
+                    .fetch_optional(&mut tx)
+                    .await?;
+            let Some(current) = current else {
+                tx.rollback().await?;
+                continue;
+            };
+            let delivery = row_to_delivery_outbox(current)?;
             let token = Uuid::new_v4().to_string();
             let changed = db::query(
                 "UPDATE deliveries SET status = 'claimed', claim_token = ?, claim_expires_at = ?, \
-                 updated_at = ? WHERE delivery_id = ? AND (status = 'pending' OR \
-                 (status = 'claimed' AND claim_expires_at <= ? AND claim_token IS ?))",
+                 updated_at = ? WHERE delivery_id = ? AND tenant = ? AND ( \
+                 (status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?)) OR \
+                 (status = 'claimed' AND (claim_expires_at IS NULL OR claim_expires_at <= ?) AND claim_token IS ?))",
             )
             .bind(&token)
             .bind(expires_at.to_rfc3339())
             .bind(now.to_rfc3339())
             .bind(delivery.delivery_id.to_string())
+            .bind(tenant)
+            .bind(now.to_rfc3339())
             .bind(now.to_rfc3339())
             .bind(delivery.claim_token.as_deref())
-            .execute(&self.pool)
+            .execute(&mut tx)
             .await?
             .rows_affected();
             if changed > 0 {
-                if let Some(record) = self.get_delivery_outbox(delivery.delivery_id).await? {
-                    claimed.push(record);
-                }
+                let row = db::query("SELECT * FROM deliveries WHERE delivery_id = ?")
+                    .bind(delivery_id.to_string())
+                    .fetch_optional(&mut tx)
+                    .await?
+                    .ok_or_else(|| anyhow!("delivery disappeared during claim"))?;
+                let record = row_to_delivery_outbox(row)?;
+                audit::record(&mut tx, AuditInput::new(Some(tenant), "delivery.claim", "delivery", Some(&delivery_id.to_string()), "succeeded", json!({
+                    "status_before":delivery.status,"status_after":"claimed","attempt":record.attempt,"lease_seconds":claim_ttl.as_secs()
+                })).for_run(delivery.run_id)).await?;
+                tx.commit().await?;
+                claimed.push(record);
+            } else {
+                tx.rollback().await?;
             }
         }
         Ok(claimed)
@@ -2318,10 +2570,13 @@ impl AgentdStore {
         tenant: &str,
         ack: DeliveryAck<'_>,
     ) -> Result<DeliveryOutboxRecord> {
-        let existing = self
-            .get_delivery_outbox(ack.delivery_id)
+        let mut tx = self.pool.begin().await?;
+        let existing = db::query("SELECT * FROM deliveries WHERE delivery_id = ?")
+            .bind(ack.delivery_id.to_string())
+            .fetch_optional(&mut tx)
             .await?
             .ok_or_else(|| anyhow!("delivery not found"))?;
+        let existing = row_to_delivery_outbox(existing)?;
         if existing.tenant != tenant
             || existing.status != "claimed"
             || existing.claim_token.as_deref() != Some(ack.claim_token)
@@ -2352,10 +2607,11 @@ impl AgentdStore {
                 ))
             }
         };
-        db::query(
+        let changed = db::query(
             "UPDATE deliveries SET status = ?, attempt = attempt + 1, next_attempt_at = ?, \
              last_error = ?, claim_token = NULL, claim_expires_at = NULL, updated_at = ? \
-             WHERE delivery_id = ? AND tenant = ? AND claim_token = ?",
+             WHERE delivery_id = ? AND tenant = ? AND status = 'claimed' AND claim_token = ? \
+             AND claim_expires_at = ? AND claim_expires_at > ?",
         )
         .bind(status)
         .bind(next_attempt_at.map(|value| value.to_rfc3339()))
@@ -2364,28 +2620,52 @@ impl AgentdStore {
         .bind(ack.delivery_id.to_string())
         .bind(tenant)
         .bind(ack.claim_token)
-        .execute(&self.pool)
-        .await?;
-        self.get_delivery_outbox(ack.delivery_id)
+        .bind(existing.claim_expires_at.map(|value| value.to_rfc3339()))
+        .bind(ack.now.to_rfc3339())
+        .execute(&mut tx)
+        .await?
+        .rows_affected();
+        if changed != 1 {
+            return Err(anyhow!("delivery claim changed before acknowledgement"));
+        }
+        let row = db::query("SELECT * FROM deliveries WHERE delivery_id = ?")
+            .bind(ack.delivery_id.to_string())
+            .fetch_optional(&mut tx)
             .await?
-            .ok_or_else(|| anyhow!("delivery disappeared after ack"))
+            .ok_or_else(|| anyhow!("delivery disappeared after ack"))?;
+        let record = row_to_delivery_outbox(row)?;
+        audit::record(&mut tx, AuditInput::new(Some(tenant), "delivery.ack", "delivery", Some(&ack.delivery_id.to_string()), "succeeded", json!({
+            "ack_outcome":ack.outcome,"status_before":"claimed","status_after":status,"attempt":record.attempt,
+            "retry_scheduled":next_attempt_at.is_some(),"error_code":ack.error.is_some().then_some("delivery_error")
+        })).for_run(existing.run_id)).await?;
+        tx.commit().await?;
+        Ok(record)
     }
 
-    async fn find_run_by_request_id(
+    async fn audit_existing_run_request(
         &self,
         tenant: &str,
         request_id: &str,
-    ) -> Result<Option<AgentRun>> {
+    ) -> Result<Option<Uuid>> {
+        let mut tx = self.pool.begin().await?;
         let row = db::query(
-            "SELECT run_id, tenant, name, agent_ref, scope, source, input_json, \
-                    output_json, error, status, request_id, created_at, started_at, updated_at \
+            "SELECT run_id, agent_ref, status \
              FROM runs WHERE tenant = ? AND request_id = ? LIMIT 1",
         )
         .bind(tenant)
         .bind(request_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut tx)
         .await?;
-        row.map(row_to_run).transpose()
+        let Some(row) = row else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let run_id = parse_uuid_field(&row, "run_id")?;
+        audit::record(&mut tx, AuditInput::new(Some(tenant), "run.submit", "run", Some(&run_id.to_string()), "noop", json!({
+            "reused":true,"status":row.try_get::<String,_>("status")?,"agent_ref":row.try_get::<String,_>("agent_ref")?
+        })).for_run(run_id)).await?;
+        tx.commit().await?;
+        Ok(Some(run_id))
     }
 
     pub async fn get_run(&self, run_id: Uuid) -> Result<Option<AgentRun>> {
@@ -2448,13 +2728,28 @@ impl AgentdStore {
 
     pub async fn cancel_run_request(&self, run_id: Uuid, reason: &str) -> Result<AgentRunStatus> {
         let mut tx = self.pool.begin().await?;
-        let current = db::query_scalar::<String>("SELECT status FROM runs WHERE run_id = ?")
+        let row = db::query("SELECT tenant, status FROM runs WHERE run_id = ?")
             .bind(run_id.to_string())
             .fetch_optional(&mut tx)
             .await?
             .ok_or_else(|| anyhow!("run not found"))?;
-        let current = status_from_wire(&current)?;
+        let tenant = row.try_get::<String, _>("tenant")?;
+        let current = status_from_wire(&row.try_get::<String, _>("status")?)?;
         if !matches!(current, AgentRunStatus::Queued | AgentRunStatus::Running) {
+            audit::record(
+                &mut tx,
+                AuditInput::new(
+                    Some(&tenant),
+                    "run.cancel",
+                    "run",
+                    Some(&run_id.to_string()),
+                    "noop",
+                    json!({"status":status_to_wire(current)}),
+                )
+                .for_run(run_id),
+            )
+            .await?;
+            tx.commit().await?;
             return Ok(current);
         }
 
@@ -2472,13 +2767,29 @@ impl AgentdStore {
         if changed != 1 {
             return Err(anyhow!("run status changed during cancellation"));
         }
-        db::query(
-            "INSERT INTO run_log (run_id, kind, payload_json, ts) VALUES (?, 'status', ?, ?)",
+        Self::append_run_trace(
+            &mut tx,
+            &tenant,
+            run_id,
+            "status",
+            &json!({"status":"cancelled", "reason":reason}),
+            &now,
         )
-        .bind(run_id.to_string())
-        .bind(json!({"status":"cancelled", "reason":reason}).to_string())
-        .bind(&now)
-        .execute(&mut tx)
+        .await?;
+        audit::record(
+            &mut tx,
+            AuditInput::new(
+                Some(&tenant),
+                "run.cancel",
+                "run",
+                Some(&run_id.to_string()),
+                "succeeded",
+                json!({
+                    "status_before":status_to_wire(current),"status_after":"cancelled"
+                }),
+            )
+            .for_run(run_id),
+        )
         .await?;
         tx.commit().await?;
         Ok(AgentRunStatus::Cancelled)
@@ -2557,6 +2868,10 @@ impl AgentdStore {
             let active_revision =
                 behavior::active_revision_for_spec(&mut tx, &tenant, &agent_ref, &agent.spec)
                     .await?;
+            audit::record(&mut tx, AuditInput::new(Some(&tenant), "run.claim", "run", Some(&run_id.to_string()), "succeeded", json!({
+                "status_before":"queued","status_after":"running","agent_ref":agent_ref,
+                "behavior_revision":active_revision.as_ref().map(|revision| revision.revision)
+            })).for_run(run_id)).await?;
             tx.commit().await?;
             run.status = AgentRunStatus::Running;
             run.started_at = Some(started_at);
@@ -2581,12 +2896,45 @@ impl AgentdStore {
     }
 
     pub async fn reset_local_runtime_state(&self) -> Result<()> {
-        db::query(
-            "UPDATE runs SET status = 'failed', error = COALESCE(error, 'agentd restarted'), updated_at = ? WHERE status = 'running'",
-        )
-        .bind(Utc::now().to_rfc3339())
-        .execute(&self.pool)
-        .await?;
+        let mut tx = self.pool.begin().await?;
+        let rows = db::query("SELECT run_id, tenant, error FROM runs WHERE status = 'running'")
+            .fetch_all(&mut tx)
+            .await?;
+        let now = Utc::now().to_rfc3339();
+        for row in rows {
+            let run_id = parse_uuid_field(&row, "run_id")?;
+            let tenant = row.try_get::<String, _>("tenant")?;
+            let error = row
+                .try_get::<Option<String>, _>("error")?
+                .unwrap_or_else(|| "agentd restarted".into());
+            let changed = db::query("UPDATE runs SET status = 'failed', error = COALESCE(error, 'agentd restarted'), updated_at = ? WHERE run_id = ? AND status = 'running'")
+                .bind(&now).bind(run_id.to_string()).execute(&mut tx).await?.rows_affected();
+            if changed == 0 {
+                continue;
+            }
+            Self::append_run_trace(
+                &mut tx,
+                &tenant,
+                run_id,
+                "error",
+                &json!({"error":error}),
+                &now,
+            )
+            .await?;
+            Self::append_run_trace(
+                &mut tx,
+                &tenant,
+                run_id,
+                "status",
+                &json!({"status":"failed"}),
+                &now,
+            )
+            .await?;
+            audit::record(&mut tx, AuditInput::new(Some(&tenant), "run.restart", "run", Some(&run_id.to_string()), "succeeded", json!({
+                "status_before":"running","status_after":"failed","error_code":"runtime_restarted"
+            })).for_run(run_id)).await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -2597,14 +2945,84 @@ impl AgentdStore {
         payload: serde_json::Value,
         ts: DateTime<Utc>,
     ) -> Result<()> {
-        db::query("INSERT INTO run_log (run_id, kind, payload_json, ts) VALUES (?, ?, ?, ?)")
+        let mut tx = self.pool.begin().await?;
+        let tenant = db::query_scalar::<String>("SELECT tenant FROM runs WHERE run_id = ?")
             .bind(run_id.to_string())
-            .bind(event_type)
-            .bind(payload.to_string())
-            .bind(ts.to_rfc3339())
-            .execute(&self.pool)
-            .await?;
+            .fetch_optional(&mut tx)
+            .await?
+            .ok_or_else(|| anyhow!("run not found for trace append"))?;
+        Self::append_run_trace(
+            &mut tx,
+            &tenant,
+            run_id,
+            event_type,
+            &payload,
+            &ts.to_rfc3339(),
+        )
+        .await?;
+        tx.commit().await?;
         Ok(())
+    }
+
+    pub(crate) async fn append_run_trace(
+        tx: &mut db::Transaction,
+        tenant: &str,
+        run_id: Uuid,
+        kind: &str,
+        payload: &serde_json::Value,
+        ts: &str,
+    ) -> Result<i64> {
+        let trace_id = db::query_scalar::<i64>(
+            "INSERT INTO run_log (run_id, kind, payload_json, ts) VALUES (?, ?, ?, ?) RETURNING id",
+        )
+        .bind(run_id.to_string())
+        .bind(kind)
+        .bind(payload.to_string())
+        .bind(ts)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| anyhow!("trace insert returned no id"))?;
+        let empty_summary = json!({});
+        let summary = if matches!(kind, "output" | "error") {
+            &empty_summary
+        } else {
+            payload
+        };
+        let outcome = if matches!(kind, "maintenance_check" | "behavior_check")
+            && summary.get("ready").and_then(serde_json::Value::as_bool) == Some(false)
+        {
+            "skipped"
+        } else {
+            match summary.get("phase").and_then(serde_json::Value::as_str) {
+                Some("request" | "call") => "started",
+                Some("error") => "failed",
+                Some("response" | "result")
+                    if kind == "tool"
+                        && payload
+                            .pointer("/result/ok")
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(false) =>
+                {
+                    "failed"
+                }
+                Some("response" | "result") => "succeeded",
+                _ => "recorded",
+            }
+        };
+        audit::record(
+            tx,
+            AuditInput::new(
+                Some(tenant),
+                "run.trace",
+                "run_trace",
+                Some(&trace_id.to_string()),
+                outcome,
+                audit_mutations::trace_summary(kind, summary, trace_id),
+            )
+            .for_run(run_id),
+        )
+        .await?;
+        Ok(trace_id)
     }
 
     /// Commit the durable result of a successful run in one transaction.
@@ -2654,66 +3072,124 @@ impl AgentdStore {
             return Err(anyhow!("run was no longer running during finalization"));
         }
 
-        db::query(
-            "INSERT INTO run_log (run_id, kind, payload_json, ts) VALUES (?, 'output', ?, ?)",
+        Self::append_run_trace(&mut tx, &tenant, run_id, "output", output, &now).await?;
+        Self::append_run_trace(
+            &mut tx,
+            &tenant,
+            run_id,
+            "status",
+            &json!({"status":"succeeded"}),
+            &now,
         )
-        .bind(run_id.to_string())
-        .bind(&output_json)
-        .bind(&now)
-        .execute(&mut tx)
-        .await?;
-        db::query(
-            "INSERT INTO run_log (run_id, kind, payload_json, ts) VALUES (?, 'status', ?, ?)",
-        )
-        .bind(run_id.to_string())
-        .bind(serde_json::json!({"status":"succeeded"}).to_string())
-        .bind(&now)
-        .execute(&mut tx)
         .await?;
         if let Some(state) = context_state {
-            db::query(
+            let state_json = serde_json::to_string(state)?;
+            let revision = db::query_scalar::<i64>(
                 "INSERT INTO contexts (tenant, agent, scope, revision, state_json, updated_at) \
                  VALUES (?, ?, ?, 1, ?, ?) \
                  ON CONFLICT(tenant, agent, scope) DO UPDATE SET \
                  revision = contexts.revision + 1, state_json = excluded.state_json, \
-                 updated_at = excluded.updated_at",
+                 updated_at = excluded.updated_at RETURNING revision",
             )
             .bind(&tenant)
             .bind(&agent)
             .bind(&scope)
-            .bind(serde_json::to_string(state)?)
+            .bind(&state_json)
             .bind(&now)
-            .execute(&mut tx)
+            .fetch_optional(&mut tx)
+            .await?
+            .ok_or_else(|| anyhow!("context update returned no revision"))?;
+            audit::record(
+                &mut tx,
+                AuditInput::new(
+                    Some(&tenant),
+                    "context.put",
+                    "context",
+                    Some(&agent),
+                    "succeeded",
+                    json!({
+                        "scope":scope,"revision":revision,"state_bytes":state_json.len()
+                    }),
+                )
+                .for_run(run_id),
+            )
             .await?;
         } else {
-            db::query("DELETE FROM contexts WHERE tenant = ? AND agent = ? AND scope = ?")
-                .bind(&tenant)
-                .bind(&agent)
-                .bind(&scope)
-                .execute(&mut tx)
-                .await?;
+            let deleted =
+                db::query("DELETE FROM contexts WHERE tenant = ? AND agent = ? AND scope = ?")
+                    .bind(&tenant)
+                    .bind(&agent)
+                    .bind(&scope)
+                    .execute(&mut tx)
+                    .await?
+                    .rows_affected()
+                    > 0;
+            audit::record(
+                &mut tx,
+                AuditInput::new(
+                    Some(&tenant),
+                    "context.delete",
+                    "context",
+                    Some(&agent),
+                    audit_mutations::outcome(deleted),
+                    json!({
+                        "scope":scope,"deleted":deleted
+                    }),
+                )
+                .for_run(run_id),
+            )
+            .await?;
         }
 
         if let Some(destination) = delivery_destination {
-            db::query(
+            let delivery_id = Uuid::new_v4();
+            let idempotency_key = format!("run:{run_id}:output");
+            let inserted = db::query(
                 r#"INSERT INTO deliveries (
                        delivery_id, tenant, run_id, status, destination,
                        payload_json, idempotency_key, attempt, created_at, updated_at
                    ) VALUES (?, ?, ?, 'pending', ?, ?, ?, 0, ?, ?)
                    ON CONFLICT(idempotency_key) DO NOTHING"#,
             )
-            .bind(Uuid::new_v4().to_string())
+            .bind(delivery_id.to_string())
             .bind(&tenant)
             .bind(run_id.to_string())
             .bind(destination)
             .bind(&output_json)
-            .bind(format!("run:{run_id}:output"))
+            .bind(&idempotency_key)
             .bind(&now)
             .bind(&now)
             .execute(&mut tx)
+            .await?
+            .rows_affected()
+                > 0;
+            let actual_id = db::query_scalar::<String>(
+                "SELECT delivery_id FROM deliveries WHERE idempotency_key = ?",
+            )
+            .bind(&idempotency_key)
+            .fetch_optional(&mut tx)
+            .await?
+            .ok_or_else(|| anyhow!("delivery not found after enqueue"))?;
+            audit::record(
+                &mut tx,
+                AuditInput::new(
+                    Some(&tenant),
+                    "delivery.enqueue",
+                    "delivery",
+                    Some(&actual_id),
+                    audit_mutations::outcome(inserted),
+                    json!({
+                        "status":"pending","payload_bytes":output_json.len(),"payload_kind":"output"
+                    }),
+                )
+                .for_run(run_id),
+            )
             .await?;
         }
         maintenance::checkpoint_success(&mut tx, run_id).await?;
+        audit::record(&mut tx, AuditInput::new(Some(&tenant), "run.succeed", "run", Some(&run_id.to_string()), "succeeded", json!({
+            "status_before":"running","status_after":"succeeded","output_bytes":output_json.len()
+        })).for_run(run_id)).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -2723,10 +3199,11 @@ impl AgentdStore {
     /// transport-neutral failure payload.
     pub async fn fail_run(&self, run_id: Uuid, error: &str) -> Result<()> {
         let mut tx = self.pool.begin().await?;
-        let row = db::query("SELECT tenant, delivery_destination FROM runs WHERE run_id = ?")
-            .bind(run_id.to_string())
-            .fetch_optional(&mut tx)
-            .await?;
+        let row =
+            db::query("SELECT tenant, status, delivery_destination FROM runs WHERE run_id = ?")
+                .bind(run_id.to_string())
+                .fetch_optional(&mut tx)
+                .await?;
         let now = Utc::now().to_rfc3339();
         let changed = db::query(
             "UPDATE runs SET status = 'failed', error = ?, updated_at = ? \
@@ -2739,39 +3216,66 @@ impl AgentdStore {
         .await?
         .rows_affected();
         if changed > 0 {
-            db::query(
-                "INSERT INTO run_log (run_id, kind, payload_json, ts) VALUES (?, 'error', ?, ?)",
-            )
-            .bind(run_id.to_string())
-            .bind(serde_json::json!({"error":error}).to_string())
-            .bind(&now)
-            .execute(&mut tx)
-            .await?;
-            if let Some(row) = row {
+            if let Some(row) = &row {
                 let tenant = row.try_get::<String, _>("tenant")?;
+                Self::append_run_trace(
+                    &mut tx,
+                    &tenant,
+                    run_id,
+                    "error",
+                    &json!({"error":error}),
+                    &now,
+                )
+                .await?;
                 let destination = row.try_get::<Option<String>, _>("delivery_destination")?;
                 if let Some(destination) = destination {
                     let payload = failure_delivery_payload(error).to_string();
-                    db::query(
+                    let delivery_id = Uuid::new_v4();
+                    let idempotency_key = format!("run:{run_id}:failure");
+                    let inserted = db::query(
                         r#"INSERT INTO deliveries (
                                delivery_id, tenant, run_id, status, destination,
                                payload_json, idempotency_key, attempt, created_at, updated_at
                            ) VALUES (?, ?, ?, 'pending', ?, ?, ?, 0, ?, ?)
                            ON CONFLICT(idempotency_key) DO NOTHING"#,
                     )
-                    .bind(Uuid::new_v4().to_string())
-                    .bind(tenant)
+                    .bind(delivery_id.to_string())
+                    .bind(&tenant)
                     .bind(run_id.to_string())
                     .bind(destination)
-                    .bind(payload)
-                    .bind(format!("run:{run_id}:failure"))
+                    .bind(&payload)
+                    .bind(&idempotency_key)
                     .bind(&now)
                     .bind(&now)
                     .execute(&mut tx)
-                    .await?;
+                    .await?
+                    .rows_affected()
+                        > 0;
+                    let actual_id = db::query_scalar::<String>(
+                        "SELECT delivery_id FROM deliveries WHERE idempotency_key = ?",
+                    )
+                    .bind(&idempotency_key)
+                    .fetch_optional(&mut tx)
+                    .await?
+                    .ok_or_else(|| anyhow!("delivery not found after failure enqueue"))?;
+                    audit::record(&mut tx, AuditInput::new(Some(&tenant), "delivery.enqueue", "delivery", Some(&actual_id), audit_mutations::outcome(inserted), json!({
+                        "status":"pending","payload_kind":"failure","payload_bytes":payload.len(),"error_code":audit_mutations::run_error_code(error)
+                    })).for_run(run_id)).await?;
                 }
             }
         }
+        let tenant = row
+            .as_ref()
+            .map(|row| row.try_get::<String, _>("tenant"))
+            .transpose()?;
+        let before = row
+            .as_ref()
+            .map(|row| row.try_get::<String, _>("status"))
+            .transpose()?;
+        audit::record(&mut tx, AuditInput::new(tenant.as_deref(), "run.fail", "run", Some(&run_id.to_string()), audit_mutations::outcome(changed > 0), json!({
+            "status_before":before,"status_after":if changed > 0 { Some("failed") } else { before.as_deref() },
+            "error_code":audit_mutations::run_error_code(error)
+        })).for_run(run_id)).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -2807,6 +3311,7 @@ impl AgentdStore {
     ) -> Result<()> {
         self.ensure_tenant_exists(tenant).await?;
         let now = Utc::now().to_rfc3339();
+        let mut tx = self.pool.begin().await?;
         db::query(
             r#"INSERT INTO artifacts (tenant, path, body, content_type, meta_json, updated_at)
                VALUES (?, ?, ?, ?, ?, ?)
@@ -2822,17 +3327,45 @@ impl AgentdStore {
         .bind(content_type)
         .bind(meta_json)
         .bind(&now)
-        .execute(&self.pool)
+        .execute(&mut tx)
         .await?;
+        audit::record(
+            &mut tx,
+            AuditInput::new(
+                Some(tenant),
+                "artifact.put",
+                "artifact",
+                Some(path),
+                "succeeded",
+                json!({"bytes":body.len(),"metadata_present":meta_json.is_some()}),
+            ),
+        )
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
     pub async fn delete_artifact(&self, tenant: &str, path: &str) -> Result<()> {
-        db::query("DELETE FROM artifacts WHERE tenant = ? AND path = ?")
+        let mut tx = self.pool.begin().await?;
+        let deleted = db::query("DELETE FROM artifacts WHERE tenant = ? AND path = ?")
             .bind(tenant)
             .bind(path)
-            .execute(&self.pool)
-            .await?;
+            .execute(&mut tx)
+            .await?
+            .rows_affected();
+        audit::record(
+            &mut tx,
+            AuditInput::new(
+                Some(tenant),
+                "artifact.delete",
+                "artifact",
+                Some(path),
+                audit_mutations::outcome(deleted > 0),
+                json!({"deleted":deleted > 0}),
+            ),
+        )
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -2959,107 +3492,282 @@ impl AgentdStore {
         now: DateTime<Utc>,
         limit: usize,
     ) -> Result<Vec<Uuid>> {
-        let rows = db::query(
+        fn identity(spec: &ScheduleSpec) -> serde_json::Value {
+            json!({
+                "agent_ref":spec.agent_ref,"scope":spec.scope,
+                "namespace":spec.payload.get("namespace").and_then(serde_json::Value::as_str),
+                "target_agent":spec.payload.get("target_agent").and_then(serde_json::Value::as_str),
+            })
+        }
+        let rows = match db::query(
             "SELECT tenant, name, spec_json FROM schedules WHERE next_trigger_at IS NOT NULL AND next_trigger_at <= ? ORDER BY next_trigger_at ASC LIMIT ?",
         )
         .bind(now.to_rfc3339())
         .bind(limit.max(1) as i64)
         .fetch_all(&self.pool)
-        .await?;
+        .await {
+            Ok(rows) => rows,
+            Err(error) => {
+                self.append_audit(AuditInput::new(None, "schedule.tick", "scheduler", None, "failed",
+                    json!({"reason":"due_schedule_query_failed"}))).await?;
+                return Err(error.into());
+            }
+        };
 
         let mut triggered = Vec::new();
         for row in rows {
             let tenant = row.try_get::<String, _>("tenant")?;
             let name = row.try_get::<String, _>("name")?;
-            let spec: ScheduleSpec = serde_json::from_str(&row.try_get::<String, _>("spec_json")?)?;
-            let mut last_run_id = None;
-            if name == MEMORY_MAINTENANCE_SCHEDULE
-                && spec.agent_ref == MEMORY_MAINTAINER_AGENT
-                && spec
-                    .payload
-                    .get("namespace")
-                    .and_then(serde_json::Value::as_str)
-                    == Some(ALL_MEMORY_NAMESPACES)
-            {
-                let namespaces = db::query(
-                    "SELECT DISTINCT namespace FROM memory WHERE tenant = ? AND namespace != ? ORDER BY namespace",
-                )
-                .bind(&tenant)
-                .bind(MEMORY_MAINTAINER_AGENT)
-                .fetch_all(&self.pool)
-                .await?;
-                for namespace in namespaces {
-                    let mut run_spec = spec.clone();
-                    run_spec.payload["namespace"] =
-                        json!(namespace.try_get::<String, _>("namespace")?);
-                    if !self.background_schedule_ready(&tenant, &run_spec).await? {
-                        continue;
-                    }
-                    let run_name = format!("{}-{}", name, Uuid::new_v4().simple());
-                    let run_id = self
-                        .submit_schedule_run(&tenant, &name, &run_spec, &run_name, now)
+            let spec: ScheduleSpec =
+                match serde_json::from_str(&row.try_get::<String, _>("spec_json")?) {
+                    Ok(spec) => spec,
+                    Err(error) => {
+                        self.append_audit(AuditInput::new(
+                            Some(&tenant),
+                            "schedule.trigger",
+                            "schedule",
+                            Some(&name),
+                            "failed",
+                            json!({"reason":"invalid_schedule","queued_count":0}),
+                        ))
                         .await?;
-                    triggered.push(run_id);
-                    last_run_id = Some(run_id);
+                        return Err(error.into());
+                    }
+                };
+            let next_trigger = match next_trigger_time(&spec, now + chrono::Duration::seconds(1)) {
+                Ok(next) => next,
+                Err(error) => {
+                    self.append_audit(AuditInput::new(
+                        Some(&tenant),
+                        "schedule.trigger",
+                        "schedule",
+                        Some(&name),
+                        "failed",
+                        json!({"reason":"next_trigger_failed","queued_count":0}),
+                    ))
+                    .await?;
+                    return Err(error);
                 }
-            } else if name == BEHAVIOR_LEARNING_SCHEDULE
-                && spec.agent_ref == BEHAVIOR_LEARNER_AGENT
-                && spec
-                    .payload
-                    .get("target_agent")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("*")
-            {
-                for agent in self.list_agents(Some(&tenant)).await? {
-                    if !behavior::is_foreground_agent(&agent) {
-                        continue;
-                    }
-                    let mut run_spec = spec.clone();
-                    run_spec.payload["target_agent"] = json!(agent.name);
-                    run_spec.scope = format!("behavior-learning/{}", agent.name);
-                    if !self.background_schedule_ready(&tenant, &run_spec).await? {
-                        continue;
-                    }
-                    let run_name = format!("{}-{}", name, Uuid::new_v4().simple());
-                    let run_id = self
-                        .submit_schedule_run(&tenant, &name, &run_spec, &run_name, now)
-                        .await?;
-                    triggered.push(run_id);
-                    last_run_id = Some(run_id);
+            };
+            let discovered: Result<Vec<ScheduleSpec>> = async {
+                if name == MEMORY_MAINTENANCE_SCHEDULE
+                    && spec.agent_ref == MEMORY_MAINTAINER_AGENT
+                    && spec.payload.get("namespace").and_then(serde_json::Value::as_str) == Some(ALL_MEMORY_NAMESPACES)
+                {
+                    let namespaces = db::query(
+                        "SELECT DISTINCT namespace FROM memory WHERE tenant = ? AND namespace != ? ORDER BY namespace",
+                    ).bind(&tenant).bind(MEMORY_MAINTAINER_AGENT).fetch_all(&self.pool).await?;
+                    namespaces.into_iter().map(|namespace| {
+                        let mut target = spec.clone();
+                        target.payload["namespace"] = json!(namespace.try_get::<String, _>("namespace")?);
+                        Ok(target)
+                    }).collect()
+                } else if name == BEHAVIOR_LEARNING_SCHEDULE
+                    && spec.agent_ref == BEHAVIOR_LEARNER_AGENT
+                    && spec.payload.get("target_agent").and_then(serde_json::Value::as_str) == Some("*")
+                {
+                    Ok(self.list_agents(Some(&tenant)).await?.into_iter()
+                        .filter(behavior::is_foreground_agent).map(|agent| {
+                            let mut target = spec.clone();
+                            target.payload["target_agent"] = json!(agent.name);
+                            target.scope = format!("behavior-learning/{}", agent.name);
+                            target
+                        }).collect())
+                } else {
+                    Ok(vec![spec.clone()])
                 }
-            } else {
-                if self.background_schedule_ready(&tenant, &spec).await? {
-                    let run_name = format!("{}-{}", name, Uuid::new_v4().simple());
-                    let run_id = self
-                        .submit_schedule_run(&tenant, &name, &spec, &run_name, now)
-                        .await?;
-                    triggered.push(run_id);
-                    last_run_id = Some(run_id);
+            }.await;
+            let (targets, mut failure) = match discovered {
+                Ok(targets) => (targets, None),
+                Err(error) => (Vec::new(), Some(("target_discovery_failed", error))),
+            };
+            let target_count = targets.len();
+            let mut queued = Vec::new();
+            let mut skipped = 0usize;
+            if failure.is_none() && targets.is_empty() {
+                if let Err(error) = self
+                    .append_audit(AuditInput::new(
+                        Some(&tenant),
+                        "schedule.decision",
+                        "schedule",
+                        Some(&name),
+                        "skipped",
+                        json!({"reason":"no_targets","agent_ref":spec.agent_ref,"target_count":0}),
+                    ))
+                    .await
+                {
+                    failure = Some(("decision_audit_failed", error));
                 }
             }
-            let next_trigger = next_trigger_time(&spec, now + chrono::Duration::seconds(1))?;
-            db::query(
-                "UPDATE schedules SET last_triggered_at = ?, next_trigger_at = ?, last_run_id = COALESCE(?, last_run_id), updated_at = ? WHERE tenant = ? AND name = ?",
-            )
-            .bind(now.to_rfc3339())
-            .bind(next_trigger.map(|value| value.to_rfc3339()))
-            .bind(last_run_id.map(|run_id| run_id.to_string()))
-            .bind(now.to_rfc3339())
-            .bind(&tenant)
-            .bind(&name)
-            .execute(&self.pool)
-            .await?;
+            for target in targets {
+                if failure.is_some() {
+                    skipped += 1;
+                    let mut details = identity(&target);
+                    details["reason"] = json!("fanout_aborted");
+                    if let Err(error) = self
+                        .append_audit(AuditInput::new(
+                            Some(&tenant),
+                            "schedule.decision",
+                            "schedule",
+                            Some(&name),
+                            "skipped",
+                            details,
+                        ))
+                        .await
+                    {
+                        failure = Some(("decision_audit_failed", error));
+                    }
+                    continue;
+                }
+                let mut details = match self.background_schedule_ready(&tenant, &target).await {
+                    Ok(details) => details,
+                    Err(error) => {
+                        let mut details = identity(&target);
+                        details["reason"] = json!("readiness_failed");
+                        let audit_result = self
+                            .append_audit(AuditInput::new(
+                                Some(&tenant),
+                                "schedule.decision",
+                                "schedule",
+                                Some(&name),
+                                "failed",
+                                details,
+                            ))
+                            .await;
+                        failure = Some(("readiness_failed", audit_result.err().unwrap_or(error)));
+                        continue;
+                    }
+                };
+                if details["ready"] != true {
+                    skipped += 1;
+                    if let Err(error) = self
+                        .append_audit(AuditInput::new(
+                            Some(&tenant),
+                            "schedule.decision",
+                            "schedule",
+                            Some(&name),
+                            "skipped",
+                            details,
+                        ))
+                        .await
+                    {
+                        failure = Some(("decision_audit_failed", error));
+                    }
+                    continue;
+                }
+                let run_name = format!("{}-{}", name, Uuid::new_v4().simple());
+                let run_id = match self
+                    .submit_schedule_run(&tenant, &name, &target, &run_name, now)
+                    .await
+                {
+                    Ok(run_id) => run_id,
+                    Err(error) => {
+                        details["reason"] = json!("enqueue_failed");
+                        let audit_result = self
+                            .append_audit(AuditInput::new(
+                                Some(&tenant),
+                                "schedule.decision",
+                                "schedule",
+                                Some(&name),
+                                "failed",
+                                details,
+                            ))
+                            .await;
+                        failure = Some(("enqueue_failed", audit_result.err().unwrap_or(error)));
+                        continue;
+                    }
+                };
+                // Submission has committed. Keep this identity even if a later
+                // trace/audit write fails, so a partial fan-out remains visible.
+                queued.push(run_id);
+                triggered.push(run_id);
+                let queue_audit: Result<()> = async {
+                    let mut tx = self.pool.begin().await?;
+                    audit::record(
+                        &mut tx,
+                        AuditInput::new(
+                            Some(&tenant),
+                            "schedule.decision",
+                            "schedule",
+                            Some(&name),
+                            "queued",
+                            details,
+                        )
+                        .for_run(run_id),
+                    )
+                    .await?;
+                    Self::append_run_trace(
+                        &mut tx,
+                        &tenant,
+                        run_id,
+                        "status",
+                        &json!({"status":"queued","source":"schedule"}),
+                        &now.to_rfc3339(),
+                    )
+                    .await?;
+                    tx.commit().await?;
+                    Ok(())
+                }
+                .await;
+                if let Err(error) = queue_audit {
+                    failure = Some(("queue_audit_failed", error));
+                }
+            }
+            let outcome = if failure.is_some() {
+                if queued.is_empty() {
+                    "failed"
+                } else {
+                    "partial"
+                }
+            } else {
+                "completed"
+            };
+            let summary: Result<()> = async {
+                let mut tx = self.pool.begin().await?;
+                db::query(
+                    "UPDATE schedules SET last_triggered_at = ?, next_trigger_at = ?, last_run_id = COALESCE(?, last_run_id), updated_at = ? WHERE tenant = ? AND name = ?",
+                ).bind(now.to_rfc3339()).bind(next_trigger.map(|value| value.to_rfc3339()))
+                    .bind(queued.last().map(Uuid::to_string)).bind(now.to_rfc3339())
+                    .bind(&tenant).bind(&name).execute(&mut tx).await?;
+                audit::record(&mut tx, AuditInput::new(Some(&tenant), "schedule.trigger", "schedule", Some(&name), outcome,
+                    json!({"reason":failure.as_ref().map(|(reason,_)|*reason),"target_count":target_count,
+                        "queued_count":queued.len(),"skipped_count":skipped,"run_ids":queued.iter().take(256).collect::<Vec<_>>(),
+                        "run_ids_truncated":queued.len() > 256,
+                        "triggered_at":now,"next_trigger_at":next_trigger}),
+                )).await?;
+                tx.commit().await?;
+                Ok(())
+            }.await;
+            if let Err(error) = summary {
+                self.append_audit(AuditInput::new(Some(&tenant), "schedule.trigger", "schedule", Some(&name),
+                    if queued.is_empty() {"failed"} else {"partial"},
+                    json!({"reason":"summary_commit_failed","queued_count":queued.len(),
+                        "run_ids":queued.iter().take(256).collect::<Vec<_>>(),"run_ids_truncated":queued.len() > 256}),
+                )).await?;
+                return Err(error);
+            }
+            if let Some((_, error)) = failure {
+                return Err(error);
+            }
         }
         Ok(triggered)
     }
 
-    async fn background_schedule_ready(&self, tenant: &str, spec: &ScheduleSpec) -> Result<bool> {
+    async fn background_schedule_ready(
+        &self,
+        tenant: &str,
+        spec: &ScheduleSpec,
+    ) -> Result<serde_json::Value> {
         if spec.agent_ref == BEHAVIOR_LEARNER_AGENT {
-            let options = serde_json::from_value(spec.payload.clone())?;
-            return Ok(self
-                .behavior_learning_readiness(tenant, &options)
-                .await?
-                .ready);
+            let options: agentd_api::BehaviorLearningOptions =
+                serde_json::from_value(spec.payload.clone())?;
+            let state = self.behavior_learning_readiness(tenant, &options).await?;
+            return Ok(
+                json!({"ready":state.ready,"reason":state.reason,"agent_ref":spec.agent_ref,
+                "target_agent":options.target_agent,"source_runs":state.source_runs,"independent_scopes":state.independent_scopes,
+                "min_samples":options.min_samples,"required_scopes":2,"max_samples":options.max_samples,
+                "pending":state.reason == "already_pending"}),
+            );
         }
         if spec.agent_ref == MEMORY_MAINTAINER_AGENT {
             let namespace = maintenance::maintenance_namespace(&spec.payload)?;
@@ -3067,19 +3775,18 @@ impl AgentdStore {
             let pending = db::query_scalar::<String>(
                 "SELECT run_id FROM runs WHERE tenant = ? AND agent_ref = ? AND scope = ? AND status IN ('queued', 'running') LIMIT 1",
             ).bind(tenant).bind(MEMORY_MAINTAINER_AGENT).bind(scope).fetch_optional(&self.pool).await?;
-            if pending.is_some() {
-                return Ok(false);
-            }
-            return Ok(self
-                .memory_maintenance_readiness(
-                    tenant,
-                    &namespace,
-                    memory_maintenance_min_entries(&spec.payload)?,
-                )
-                .await?
-                .ready);
+            let min_entries = memory_maintenance_min_entries(&spec.payload)?;
+            let state = self
+                .memory_maintenance_readiness(tenant, &namespace, min_entries)
+                .await?;
+            return Ok(json!({"ready":state.ready && pending.is_none(),
+                "reason":if pending.is_some() {"already_pending"} else {state.reason.as_deref().unwrap_or("ready")},
+                "agent_ref":spec.agent_ref,"namespace":namespace,"entries":state.entries,"min_entries":min_entries,
+                "external_revision":state.external_revision,"pending":pending.is_some()}));
         }
-        Ok(true)
+        Ok(
+            json!({"ready":true,"reason":"ready","agent_ref":spec.agent_ref,"scope":spec.scope,"pending":false}),
+        )
     }
 
     async fn submit_schedule_run(
@@ -3101,30 +3808,23 @@ impl AgentdStore {
                 input["namespace"] = namespace.clone();
             }
         }
-        let run_id = self
-            .submit_run(NewRun {
-                tenant,
-                name: run_name,
-                agent_ref: &spec.agent_ref,
-                scope: &spec.scope,
-                source: "schedule",
-                input: &input,
-                request_id: None,
-                schedule_name: Some(schedule_name),
-                delivery_destination: spec
-                    .delivery
-                    .as_ref()
-                    .map(|delivery| delivery.destination.as_str()),
-            })
-            .await?;
-        self.append_event(
-            run_id,
-            "status",
-            json!({ "status": "queued", "source": "schedule" }),
-            now,
-        )
-        .await?;
-        Ok(run_id)
+        // Keep post-submission writes in the caller, where the committed run ID
+        // is available for partial-failure audit summaries.
+        self.submit_run(NewRun {
+            tenant,
+            name: run_name,
+            agent_ref: &spec.agent_ref,
+            scope: &spec.scope,
+            source: "schedule",
+            input: &input,
+            request_id: None,
+            schedule_name: Some(schedule_name),
+            delivery_destination: spec
+                .delivery
+                .as_ref()
+                .map(|delivery| delivery.destination.as_str()),
+        })
+        .await
     }
 
     pub async fn delete_agent(&self, tenant: &str, name: &str) -> Result<bool> {
@@ -3141,6 +3841,18 @@ impl AgentdStore {
             .bind(name)
             .execute(&mut tx)
             .await?;
+        audit::record(
+            &mut tx,
+            AuditInput::new(
+                Some(tenant),
+                "agent.delete",
+                "agent",
+                Some(name),
+                audit_mutations::outcome(result.rows_affected() > 0),
+                json!({"deleted":result.rows_affected() > 0,"behavior_head_cleared":true}),
+            ),
+        )
+        .await?;
         tx.commit().await?;
         Ok(result.rows_affected() > 0)
     }
@@ -3150,10 +3862,15 @@ impl AgentdStore {
             return Err(anyhow!("cannot delete the system tenant"));
         }
         let mut tx = self.pool.begin().await?;
-        db::query("DELETE FROM run_log WHERE run_id IN (SELECT run_id FROM runs WHERE tenant = ?)")
-            .bind(tenant)
-            .execute(&mut tx)
-            .await?;
+        let mut removed = serde_json::Map::new();
+        let logs = db::query(
+            "DELETE FROM run_log WHERE run_id IN (SELECT run_id FROM runs WHERE tenant = ?)",
+        )
+        .bind(tenant)
+        .execute(&mut tx)
+        .await?
+        .rows_affected();
+        removed.insert("run_log".into(), json!(logs));
         for table in [
             "deliveries",
             "runs",
@@ -3170,16 +3887,30 @@ impl AgentdStore {
             "memory_maintenance_runs",
             "agents",
         ] {
-            db::query(&format!("DELETE FROM {table} WHERE tenant = ?"))
+            let count = db::query(&format!("DELETE FROM {table} WHERE tenant = ?"))
                 .bind(tenant)
                 .execute(&mut tx)
-                .await?;
+                .await?
+                .rows_affected();
+            removed.insert(table.into(), json!(count));
         }
         let deleted = db::query("DELETE FROM tenants WHERE name = ?")
             .bind(tenant)
             .execute(&mut tx)
             .await?
             .rows_affected();
+        audit::record(
+            &mut tx,
+            AuditInput::new(
+                Some(tenant),
+                "tenant.delete",
+                "tenant",
+                Some(tenant),
+                audit_mutations::outcome(deleted > 0),
+                json!({"deleted":deleted > 0,"removed":removed}),
+            ),
+        )
+        .await?;
         tx.commit().await?;
         Ok(json!({ "tenant": tenant, "deleted": deleted > 0 }))
     }
@@ -4777,7 +5508,7 @@ mod tests {
                 .fetch_optional(&migrated.pool)
                 .await
                 .unwrap(),
-            Some(10)
+            Some(11)
         );
         assert!(migrated
             .get_memory("one", "profile", "favorite")
@@ -4829,7 +5560,7 @@ mod tests {
                 .fetch_optional(&migrated.pool)
                 .await
                 .unwrap(),
-            Some(10)
+            Some(11)
         );
     }
 
