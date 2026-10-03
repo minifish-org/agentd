@@ -128,6 +128,8 @@ Agent JSON/TOML is flat: `persona`, `model`, `allowed_families`, `timeout_ms`,
 `sandbox` family; add `sandbox` explicitly to opt an agent into command
 execution. `allowed_families = []` exposes none.
 `context_window` counts complete user/assistant turns, and `0` disables context.
+Omitting `max_tokens` delegates the generation budget to the model provider;
+agentd forwards an explicit value without adding its own default token limit.
 
 ## Submit a turn
 

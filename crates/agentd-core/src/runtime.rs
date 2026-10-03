@@ -343,9 +343,11 @@ impl RuntimeEngine {
             let mut request = json!({
                 "messages": messages,
                 "temperature": assigned.agent_temperature.unwrap_or(0.2),
-                "max_tokens": assigned.agent_max_tokens.unwrap_or(4096),
                 "response_format": {"type":"json_object"},
             });
+            if let Some(max_tokens) = assigned.agent_max_tokens {
+                request["max_tokens"] = json!(max_tokens);
+            }
             if !tools.is_empty() {
                 request["parallel_tool_calls"] = json!(false);
                 request["tools"] = Value::Array(tools.clone());
@@ -1187,6 +1189,7 @@ mod tests {
     #[tokio::test]
     async fn native_loop_commits_output_context_trace_and_delivery() {
         async fn completion(Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
+            assert!(body.get("max_tokens").is_none());
             assert!(body.get("parallel_tool_calls").is_none());
             assert_eq!(body["messages"][1]["content"][2]["type"], "image_url");
             assert_eq!(
