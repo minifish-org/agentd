@@ -395,36 +395,8 @@ impl RuntimeEngine {
             "behavior-learning model input exceeds 256 KiB"
         );
         budget.used += 1;
-        self.store
-            .append_event(
-                run_id,
-                "model",
-                json!({"phase":"request","stage":stage,"step":budget.used,"request":request}),
-                Utc::now(),
-            )
-            .await?;
-        let result = tokio::time::timeout_at(budget.deadline, self.caps.chat_completion(&request))
-            .await
-            .map_err(|_| anyhow!("behavior-learning deadline exceeded"))
-            .and_then(|result| result);
-        let response = match result {
-            Ok(response) => response,
-            Err(error) => {
-                self.store.append_event(
-                    run_id, "model",
-                    json!({"phase":"error","stage":stage,"step":budget.used,"reason":"model_request_failed"}),
-                    Utc::now(),
-                ).await?;
-                return Err(error);
-            }
-        };
-        self.store
-            .append_event(
-                run_id,
-                "model",
-                json!({"phase":"response","stage":stage,"step":budget.used,"response":response}),
-                Utc::now(),
-            )
+        let response = self
+            .traced_completion(run_id, budget.used, Some(stage), &request, budget.deadline)
             .await?;
         ensure!(
             response
@@ -689,7 +661,9 @@ fn decision(response: &Value, request: &Value) -> Result<Decision> {
                 .and_then(|text| serde_json::from_str::<Value>(text).ok());
             match arguments {
                 Some(arguments) if arguments.is_object() => {
-                    if let Err(error) = crate::validate_against_schema(schema, &arguments) {
+                    if let Err(error) =
+                        crate::tool_input::validate_tool_input(name, schema, &arguments)
+                    {
                         errors.push(format!("{name}: {error}"));
                     }
                 }

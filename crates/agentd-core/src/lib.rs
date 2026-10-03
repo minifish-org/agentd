@@ -10,10 +10,12 @@ mod embedding_provider;
 mod handlers;
 mod llm_provider;
 mod mcp_client;
+mod model_exchange;
 mod reranking_provider;
 mod sandbox;
 mod storage;
 mod time_utils;
+mod tool_input;
 
 mod multimodal;
 mod runtime;
@@ -35,50 +37,6 @@ claim to remember facts you did not read or write. Store generated files with \
 artifact_write and return their artifact_ref in an `attachments` array. Return \
 one JSON object matching any schema requested by the caller. Otherwise return \
 at least a non-empty `reply` string. Output JSON only.";
-
-fn validate_against_schema(
-    schema: &serde_json::Value,
-    params: &serde_json::Value,
-) -> Result<(), String> {
-    let Some(schema) = schema.as_object() else {
-        return Ok(());
-    };
-    if schema.get("type").and_then(|value| value.as_str()) != Some("object") {
-        return Ok(());
-    }
-    let Some(params) = params.as_object() else {
-        return Err("expected an object".to_string());
-    };
-    if schema.contains_key("anyOf") || schema.contains_key("oneOf") {
-        return Ok(());
-    }
-    if let Some(required) = schema.get("required").and_then(|value| value.as_array()) {
-        for key in required.iter().filter_map(|value| value.as_str()) {
-            let value = params.get(key);
-            if value.is_none() || matches!(value, Some(serde_json::Value::Null)) {
-                return Err(format!("missing required field '{key}'"));
-            }
-            let min_length = schema
-                .get("properties")
-                .and_then(|value| value.get(key))
-                .filter(|field| {
-                    field.get("type").and_then(|value| value.as_str()) == Some("string")
-                })
-                .and_then(|field| field.get("minLength"))
-                .and_then(|value| value.as_u64())
-                .unwrap_or(0);
-            if min_length > 0
-                && value
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("")
-                    .is_empty()
-            {
-                return Err(format!("required field '{key}' must be non-empty"));
-            }
-        }
-    }
-    Ok(())
-}
 
 #[derive(Clone, Debug)]
 pub struct CapabilityEngineConfig {
@@ -180,7 +138,7 @@ impl CapabilityEngine {
         }
     }
 
-    pub async fn cleanup_sandbox_run(&self, run_id: uuid::Uuid) {
+    pub async fn cleanup_sandbox_run(&self, run_id: uuid::Uuid) -> Result<()> {
         if let Some(manager) = &self.sandbox {
             let tenant = self
                 .store
@@ -208,13 +166,12 @@ impl CapabilityEngine {
                 },
             )
             .await;
-            if let Err(error) = result {
-                tracing::warn!(run_id = %run_id, error = %error, "sandbox cleanup failed");
-            }
+            return result;
         }
+        Ok(())
     }
 
-    pub async fn cleanup_all_sandboxes(&self) {
+    pub async fn cleanup_all_sandboxes(&self) -> Result<()> {
         if let Some(manager) = &self.sandbox {
             self.audit_sandbox_cleanup(None, None, "sandbox.cleanup_all", "started")
                 .await;
@@ -230,10 +187,30 @@ impl CapabilityEngine {
                 },
             )
             .await;
-            if let Err(error) = result {
-                tracing::warn!(error = %error, "sandbox shutdown cleanup failed");
-            }
+            return result;
         }
+        Ok(())
+    }
+
+    pub async fn cleanup_sandbox_tenant(&self, tenant: &str) -> Result<()> {
+        let Some(manager) = &self.sandbox else {
+            return Ok(());
+        };
+        self.audit_sandbox_cleanup(Some(tenant), None, "sandbox.cleanup_tenant", "started")
+            .await;
+        let result = manager.destroy_tenant(tenant).await;
+        self.audit_sandbox_cleanup(
+            Some(tenant),
+            None,
+            "sandbox.cleanup_tenant",
+            if result.is_ok() {
+                "succeeded"
+            } else {
+                "failed"
+            },
+        )
+        .await;
+        result
     }
 
     pub async fn reap_sandbox_orphans(&self) -> Result<usize> {
@@ -312,7 +289,8 @@ impl CapabilityEngine {
         tool: &ToolSpec,
         params: &serde_json::Value,
     ) -> ToolResult {
-        if let Err(error) = validate_against_schema(&tool.input_schema, params) {
+        if let Err(error) = tool_input::validate_tool_input(&tool.name, &tool.input_schema, params)
+        {
             return ToolResult::failure(format!(
                 "input does not match {}'s schema: {error}",
                 tool.name
@@ -346,6 +324,10 @@ impl CapabilityEngine {
 
     pub async fn invalidate_mcp_session(&self, tenant: &str, name: &str) {
         self.mcp.invalidate(tenant, name).await;
+    }
+
+    pub async fn cleanup_mcp_tenant(&self, tenant: &str) {
+        self.mcp.invalidate_tenant(tenant).await;
     }
 
     async fn resolve_mcp_invocation_target(

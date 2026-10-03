@@ -87,3 +87,37 @@ fn malformed_trial_envelopes_are_not_valid_final_answers() {
             .is_empty());
     }
 }
+
+#[test]
+fn builtin_parser_failures_are_invalid_offline_decisions() {
+    let catalog = agentd_api::builtin_tool_catalog();
+    for (name, arguments) in [
+        ("sandbox_session", json!({"action":"shell"})),
+        ("memory_search", json!({"query":"x","limit":"five"})),
+        ("memory_search", json!({"query":" "})),
+        ("memory_put", json!({"id":"x","text":" "})),
+        ("graph_query", json!({"entity":" "})),
+        (
+            "graph_query",
+            json!({"entity":"x","direction":"sideways","max_hops":999}),
+        ),
+        ("artifact_write", json!({"path":"report.txt"})),
+        ("artifact_read", json!({"artifact_ref":"bogus"})),
+        ("memory_list", json!({"cursor":"bogus"})),
+        ("web_fetch", json!({"url":"file:///tmp/test"})),
+        ("calc_eval", json!({"expression":"1/0"})),
+    ] {
+        let tool = catalog.iter().find(|tool| tool.name == name).unwrap();
+        let request = json!({"tools":[native_function_tool(tool)]});
+        let response = json!({"choices":[{"message":{"role":"assistant","tool_calls":[{
+            "type":"function","id":"test","function":{"name":name,"arguments":arguments.to_string()}
+        }]}}]});
+        assert!(
+            !decision(&response, &request)
+                .unwrap()
+                .validation_errors
+                .is_empty(),
+            "{name}: {arguments}"
+        );
+    }
+}

@@ -8,6 +8,32 @@ not preserved unless a release note explicitly says otherwise.
 
 ### Fixed
 
+- Panicked, cancelled and shutdown executions now share supervised run-state
+  finalization and sandbox cleanup. Tenant deletion stops its active executions.
+- Failed sandbox destruction retains its session for retry and prevents tenant
+  deletion from reporting success. Shutdown waits for detached cancellations
+  and tenant deletions, including requests whose clients disconnected.
+- Startup obtains the listener and database runtime lock before recovery or
+  data reset, so a duplicate instance cannot fail another instance's runs.
+  Enabled sandbox runtimes also lock their canonical state directory before
+  installation or orphan reaping.
+- Queued runs in unrelated scopes remain claimable when an active scope has
+  more than 64 waiting runs.
+- Schedule retries reuse committed runs for the original occurrence after an
+  interrupted fan-out or failed schedule-summary commit.
+- Artifact references encode and decode database keys consistently across the
+  API, store and tool runtime, including Unicode, spaces and URI delimiters.
+  Pagination no longer skips boundary items, and prefixes match literally.
+  Tool requests above one storage page return up to the advertised limit.
+- Timezone parsing rejects malformed and out-of-range offsets without panics;
+  schedule and clock tools share the same parsing rules.
+- Runtime and offline learning use the same tool-argument validation, including
+  nested fields, types, alternatives, enumerations and numeric bounds.
+- Preset repairs preserve concurrent configuration changes and commit their
+  agent and schedule changes atomically.
+- Run, memory and artifact writes validate their tenant references inside the
+  write transaction, preventing orphan rows after concurrent tenant deletion.
+
 - Native libsql connections now close their handle only once, through a
   pinned local patch; concurrent connection teardown no longer repeats the
   close on a potentially reused pointer.
@@ -35,6 +61,19 @@ not preserved unless a release note explicitly says otherwise.
   machine-readable timeout/failure code and a retry-safe user-facing reply.
 
 ### Changed
+
+- Storage responsibilities are separated behind the existing `AgentdStore`
+  facade, retaining atomic run/context/delivery/audit commits. Domain errors
+  distinguish invalid input, missing resources and conflicts from internal
+  database failures in HTTP responses.
+- Foreground execution and behavior learning share traced model exchanges;
+  learning budgets and tool-free evaluation remain separate.
+- Constant HTML extraction expressions are compiled once and reused.
+- HTTP MCP calls share session initialization while running network requests
+  concurrently; tenant deletion invalidates only that tenant's sessions.
+- Semantic memory ranking reads bounded batches and retains only the best
+  candidates within one database snapshot, reducing temporary memory without
+  truncating the namespace scan or mixing concurrent revisions.
 
 - New tenants automatically receive both background agents and schedules;
   startup fills missing resources for existing tenants. Compatible settings,

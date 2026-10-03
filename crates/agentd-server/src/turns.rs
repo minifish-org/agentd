@@ -17,17 +17,20 @@ pub(crate) struct SubmitTurn<'a> {
 
 pub(crate) async fn submit_turn(state: &AppState, turn: SubmitTurn<'_>) -> Result<Uuid> {
     state
-        .store
-        .submit_run(NewRun {
-            tenant: turn.tenant,
-            name: &turn.run_name,
-            agent_ref: turn.agent_ref,
-            scope: turn.scope,
-            source: turn.transport,
-            input: &turn.request,
-            request_id: turn.request_id.as_deref(),
-            schedule_name: None,
-            delivery_destination: turn.delivery_destination.as_deref(),
-        })
+        .supervisor
+        .submit_run(
+            state,
+            NewRun {
+                tenant: turn.tenant,
+                name: &turn.run_name,
+                agent_ref: turn.agent_ref,
+                scope: turn.scope,
+                source: turn.transport,
+                input: &turn.request,
+                request_id: turn.request_id.as_deref(),
+                schedule_name: None,
+                delivery_destination: turn.delivery_destination.as_deref(),
+            },
+        )
         .await
 }

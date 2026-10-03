@@ -99,6 +99,7 @@ impl std::fmt::Debug for SandboxSessionManager {
 
 #[derive(Default)]
 struct SessionSlot {
+    tenant: String,
     closing: bool,
     creating: Option<JoinHandle<Result<Arc<dyn SandboxInstance>>>>,
     instance: Option<Arc<dyn SandboxInstance>>,
@@ -127,6 +128,53 @@ enum SandboxSessionRequest {
         #[serde(default)]
         timeout_ms: Option<u64>,
     },
+}
+
+fn parse_request(params: &Value) -> Result<SandboxSessionRequest> {
+    let request: SandboxSessionRequest = serde_json::from_value(params.clone())
+        .map_err(|error| anyhow!("invalid sandbox_session input: {error}"))?;
+    let (command, cwd, env, timeout_ms) = match &request {
+        SandboxSessionRequest::Exec {
+            command,
+            cwd,
+            env,
+            timeout_ms,
+            ..
+        } => (command, cwd, env, timeout_ms),
+        SandboxSessionRequest::Shell {
+            script,
+            cwd,
+            env,
+            timeout_ms,
+        } => (script, cwd, env, timeout_ms),
+    };
+    if command.trim().is_empty() {
+        return Err(anyhow!(
+            "sandbox_session command or script must not be empty"
+        ));
+    }
+    if cwd.as_ref().is_some_and(|cwd| !cwd.starts_with('/')) {
+        return Err(anyhow!(
+            "sandbox_session cwd must be an absolute guest path"
+        ));
+    }
+    for name in env.keys() {
+        if !valid_env_name(name) {
+            return Err(anyhow!(
+                "sandbox_session env contains invalid variable name {name:?}"
+            ));
+        }
+    }
+    if *timeout_ms == Some(0) {
+        return Err(anyhow!(
+            "sandbox_session timeout_ms must be greater than zero"
+        ));
+    }
+    Ok(request)
+}
+
+pub(crate) fn validate_input(params: &Value) -> Result<()> {
+    parse_request(params).map(|_| ())
 }
 
 #[derive(Debug, Clone)]
@@ -223,53 +271,73 @@ impl SandboxSessionManager {
     }
 
     pub async fn destroy_run(&self, run_id: Uuid) -> Result<()> {
-        let slot = self.sessions.lock().await.remove(&run_id);
+        let slot = self.sessions.lock().await.get(&run_id).cloned();
         let Some(slot) = slot else {
             return Ok(());
         };
-        let (instance, creating) = {
-            let mut state = slot.lock().await;
-            state.closing = true;
-            (state.instance.take(), state.creating.take())
-        };
-        let mut instances = instance.into_iter().collect::<Vec<_>>();
-        if let Some(creating) = creating {
-            match creating.await {
-                Ok(Ok(instance)) => instances.push(instance),
+        // Keep the slot registered and serialize cleanup through destruction.
+        // Cancellation or failure leaves the resource available to a later retry.
+        let mut state = slot.lock().await;
+        state.closing = true;
+        if let Some(creating) = state.creating.as_mut() {
+            let created = creating.await;
+            state.creating.take();
+            match created {
+                Ok(Ok(instance)) => state.instance = Some(instance),
                 Ok(Err(error)) => {
-                    tracing::warn!(run_id = %run_id, error = %error, "sandbox creation failed while closing session");
+                    tracing::warn!(run_id = %run_id, error = %error, "sandbox creation failed while closing session")
                 }
                 Err(error) => {
-                    tracing::warn!(run_id = %run_id, error = %error, "sandbox creation task failed while closing session");
+                    tracing::warn!(run_id = %run_id, error = %error, "sandbox creation task failed while closing session")
                 }
             }
-        }
-        if instances.is_empty() {
-            return Ok(());
         }
         let started = StdInstant::now();
-        let mut result = Ok(());
-        for instance in instances {
-            if let Err(error) = instance.destroy().await {
-                if result.is_ok() {
-                    result = Err(error);
+        let result = match state.instance.as_ref() {
+            Some(instance) => instance.destroy().await,
+            None => Ok(()),
+        };
+        match &result {
+            Ok(()) => {
+                state.instance.take();
+                let mut sessions = self.sessions.lock().await;
+                if sessions
+                    .get(&run_id)
+                    .is_some_and(|active| Arc::ptr_eq(active, &slot))
+                {
+                    sessions.remove(&run_id);
+                }
+                tracing::info!(run_id = %run_id, duration_ms = started.elapsed().as_millis() as u64, "sandbox session destroyed");
+            }
+            Err(error) => {
+                tracing::warn!(run_id = %run_id, duration_ms = started.elapsed().as_millis() as u64, error = %error, "failed to destroy sandbox session; retained for retry")
+            }
+        }
+        result
+    }
+
+    pub async fn destroy_tenant(&self, tenant: &str) -> Result<()> {
+        // Snapshot before taking slot locks: destroy_run acquires the map only
+        // after its slot lock, so awaiting under the map lock would deadlock.
+        let sessions = self
+            .sessions
+            .lock()
+            .await
+            .iter()
+            .map(|(run_id, slot)| (*run_id, slot.clone()))
+            .collect::<Vec<_>>();
+        let mut first_error = None;
+        for (run_id, slot) in sessions {
+            if slot.lock().await.tenant != tenant {
+                continue;
+            }
+            if let Err(error) = self.destroy_run(run_id).await {
+                if first_error.is_none() {
+                    first_error = Some(error);
                 }
             }
         }
-        match &result {
-            Ok(()) => tracing::info!(
-                run_id = %run_id,
-                duration_ms = started.elapsed().as_millis() as u64,
-                "sandbox session destroyed"
-            ),
-            Err(error) => tracing::warn!(
-                run_id = %run_id,
-                duration_ms = started.elapsed().as_millis() as u64,
-                error = %error,
-                "failed to destroy sandbox session"
-            ),
-        }
-        result
+        first_error.map_or(Ok(()), Err)
     }
 
     pub async fn destroy_all(&self) -> Result<()> {
@@ -290,8 +358,7 @@ impl SandboxSessionManager {
         context: &RunExecutionContext,
         params: &Value,
     ) -> Result<Value> {
-        let request: SandboxSessionRequest = serde_json::from_value(params.clone())
-            .map_err(|error| anyhow!("invalid sandbox_session input: {error}"))?;
+        let request = parse_request(params)?;
         let (action, program, args, cwd, env, requested_timeout_ms) = match request {
             SandboxSessionRequest::Exec {
                 command,
@@ -299,50 +366,22 @@ impl SandboxSessionManager {
                 cwd,
                 env,
                 timeout_ms,
-            } => {
-                if command.trim().is_empty() {
-                    return Err(anyhow!("sandbox_session exec command must not be empty"));
-                }
-                ("exec", command, args, cwd, env, timeout_ms)
-            }
+            } => ("exec", command, args, cwd, env, timeout_ms),
             SandboxSessionRequest::Shell {
                 script,
                 cwd,
                 env,
                 timeout_ms,
-            } => {
-                if script.trim().is_empty() {
-                    return Err(anyhow!("sandbox_session shell script must not be empty"));
-                }
-                (
-                    "shell",
-                    "/bin/bash".to_string(),
-                    vec!["-lc".to_string(), script],
-                    cwd,
-                    env,
-                    timeout_ms,
-                )
-            }
+            } => (
+                "shell",
+                "/bin/bash".to_string(),
+                vec!["-lc".to_string(), script],
+                cwd,
+                env,
+                timeout_ms,
+            ),
         };
         let cwd = cwd.unwrap_or_else(|| DEFAULT_CWD.to_string());
-        if !cwd.starts_with('/') {
-            return Err(anyhow!(
-                "sandbox_session cwd must be an absolute guest path"
-            ));
-        }
-        for name in env.keys() {
-            if !valid_env_name(name) {
-                return Err(anyhow!(
-                    "sandbox_session env contains invalid variable name {name:?}"
-                ));
-            }
-        }
-        if requested_timeout_ms == Some(0) {
-            return Err(anyhow!(
-                "sandbox_session timeout_ms must be greater than zero"
-            ));
-        }
-
         let configured_timeout = requested_timeout_ms
             .map(Duration::from_millis)
             .unwrap_or(self.config.default_command_timeout);
@@ -365,7 +404,12 @@ impl SandboxSessionManager {
             let mut sessions = self.sessions.lock().await;
             sessions
                 .entry(context.run_id)
-                .or_insert_with(|| Arc::new(Mutex::new(SessionSlot::default())))
+                .or_insert_with(|| {
+                    Arc::new(Mutex::new(SessionSlot {
+                        tenant: context.tenant.clone(),
+                        ..SessionSlot::default()
+                    }))
+                })
                 .clone()
         };
         let started = StdInstant::now();
@@ -634,6 +678,46 @@ mod tests {
 
     struct FailingInstance;
 
+    #[derive(Default)]
+    struct RetryDestroyBackend {
+        creates: AtomicUsize,
+        destroys: Arc<AtomicUsize>,
+    }
+
+    struct RetryDestroyInstance {
+        destroys: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl SandboxBackend for RetryDestroyBackend {
+        async fn create(&self, _spec: SandboxCreateSpec) -> Result<Arc<dyn SandboxInstance>> {
+            self.creates.fetch_add(1, Ordering::SeqCst);
+            Ok(Arc::new(RetryDestroyInstance {
+                destroys: self.destroys.clone(),
+            }))
+        }
+        async fn reap_managed(&self) -> Result<usize> {
+            Ok(0)
+        }
+    }
+
+    #[async_trait]
+    impl SandboxInstance for RetryDestroyInstance {
+        async fn execute(&self, _command: SandboxCommand) -> Result<SandboxCommandOutcome> {
+            Ok(SandboxCommandOutcome::Completed {
+                exit_code: 0,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }
+        async fn destroy(&self) -> Result<()> {
+            if self.destroys.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(anyhow!("transient destroy failure"));
+            }
+            Ok(())
+        }
+    }
+
     #[async_trait]
     impl SandboxBackend for FakeBackend {
         async fn create(&self, _spec: SandboxCreateSpec) -> Result<Arc<dyn SandboxInstance>> {
@@ -752,6 +836,37 @@ mod tests {
             scope: "chat/1".into(),
             deadline: Instant::now() + Duration::from_secs(60),
         }
+    }
+
+    #[tokio::test]
+    async fn failed_destroy_retains_the_closed_session_for_tenant_retry() {
+        let backend = Arc::new(RetryDestroyBackend::default());
+        let manager = SandboxSessionManager::from_backend(config(1024), backend.clone());
+        let run_id = Uuid::new_v4();
+        let request = json!({"action":"exec","command":"true"});
+        manager.execute(&context(run_id), &request).await.unwrap();
+        let mut other = context(Uuid::new_v4());
+        other.tenant = "other".into();
+        manager.execute(&other, &request).await.unwrap();
+
+        assert!(manager.destroy_run(run_id).await.is_err());
+        assert!(manager.sessions.lock().await.contains_key(&run_id));
+        assert!(manager
+            .execute(&context(run_id), &request)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("closing"));
+        assert_eq!(backend.creates.load(Ordering::SeqCst), 2);
+        manager.destroy_tenant("demo").await.unwrap();
+        assert!(!manager.sessions.lock().await.contains_key(&run_id));
+        assert!(manager.sessions.lock().await.contains_key(&other.run_id));
+        assert_eq!(backend.destroys.load(Ordering::SeqCst), 2);
+        manager.destroy_tenant("demo").await.unwrap();
+        assert_eq!(backend.destroys.load(Ordering::SeqCst), 2);
+        manager.destroy_all().await.unwrap();
+        assert!(manager.sessions.lock().await.is_empty());
+        assert_eq!(backend.destroys.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]

@@ -16,6 +16,12 @@ schedules are enabled. Existing compatible settings, including explicit
 runs and model calls until memory content changes or enough independent learning
 history exists. Pause either task through its schedule's `enabled` field.
 
+Each running instance holds an exclusive lock beside its canonical database
+path, and enabled sandbox runtimes also lock their canonical state directory.
+A second instance cannot reset or recover the same database or reap sandboxes
+from the same directory. Lock files remain in place after exit; ownership is
+released automatically when their open file handles close.
+
 The deployment image includes pinned INT8 ONNX and tokenizer assets for
 multilingual E5 Small and BGE reranker v2-m3. Startup verifies every asset
 checksum, loads both models, and runs inference before accepting traffic. There

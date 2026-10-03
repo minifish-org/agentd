@@ -43,37 +43,18 @@ impl CapabilityEngine {
         params: &serde_json::Value,
     ) -> Result<serde_json::Value> {
         let name = schedule_name_from_params(params, "schedule_put")?;
-        let spec = ScheduleSpec {
-            agent_ref: required_string(params, "agent_ref")?,
-            scope: required_string(params, "scope")?,
-            payload: params.get("payload").cloned().unwrap_or_default(),
-            delivery: params
-                .get("delivery")
-                .cloned()
-                .map(serde_json::from_value::<DeliveryRequest>)
-                .transpose()?,
-            at: params
-                .get("at")
-                .and_then(serde_json::Value::as_str)
-                .map(|value| {
-                    DateTime::parse_from_rfc3339(value).map(|value| value.with_timezone(&Utc))
-                })
-                .transpose()?,
-            cron: optional_string(params, "cron"),
-            timezone: optional_string(params, "timezone"),
-            enabled: params
-                .get("enabled")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(true),
-        };
-        spec.validate().map_err(|error| anyhow!(error))?;
+        let spec = parse_spec(
+            params,
+            &required_string(params, "agent_ref")?,
+            &required_string(params, "scope")?,
+        )?;
         let store = &self.store;
         store.put_schedule(tenant, &name, &spec).await?;
         Ok(serde_json::to_value(
             store
                 .get_schedule(tenant, &name)
                 .await?
-                .expect("schedule was just stored"),
+                .ok_or_else(|| anyhow!("schedule was removed after it was stored"))?,
         )?)
     }
 
@@ -91,6 +72,37 @@ impl CapabilityEngine {
         ensure_owner(&schedule.spec, params)?;
         self.store.delete_schedule(tenant, &name).await
     }
+}
+
+fn parse_spec(params: &serde_json::Value, agent_ref: &str, scope: &str) -> Result<ScheduleSpec> {
+    let spec = ScheduleSpec {
+        agent_ref: agent_ref.to_string(),
+        scope: scope.to_string(),
+        payload: params.get("payload").cloned().unwrap_or_default(),
+        delivery: params
+            .get("delivery")
+            .cloned()
+            .map(serde_json::from_value::<DeliveryRequest>)
+            .transpose()?,
+        at: params
+            .get("at")
+            .and_then(serde_json::Value::as_str)
+            .map(|value| DateTime::parse_from_rfc3339(value).map(|value| value.with_timezone(&Utc)))
+            .transpose()?,
+        cron: optional_string(params, "cron"),
+        timezone: optional_string(params, "timezone"),
+        enabled: params
+            .get("enabled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true),
+    };
+    spec.validate().map_err(|error| anyhow!(error))?;
+    Ok(spec)
+}
+
+pub(crate) fn validate_input(params: &serde_json::Value) -> Result<()> {
+    schedule_name_from_params(params, "schedule_put")?;
+    parse_spec(params, "validation", "validation").map(|_| ())
 }
 
 fn required_string(params: &serde_json::Value, key: &str) -> Result<String> {

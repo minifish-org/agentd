@@ -27,9 +27,7 @@ pub(crate) async fn get_run(
 ) -> impl IntoResponse {
     match parse_uuid(&id) {
         Ok(result) => match state.store.get_run(result).await {
-            Ok(Some(run)) if run.tenant == tenant => {
-                (StatusCode::OK, Json(serde_json::to_value(run).unwrap())).into_response()
-            }
+            Ok(Some(run)) if run.tenant == tenant => (StatusCode::OK, Json(run)).into_response(),
             Ok(Some(_)) | Ok(None) => (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({"error": "run not found"})),
@@ -48,14 +46,22 @@ pub(crate) async fn wait_run(
 ) -> impl IntoResponse {
     let timeout = std::time::Duration::from_millis(query.timeout_ms.unwrap_or(30_000).max(1));
     let Ok(run_id) = parse_uuid(&id) else {
-        return error_response(anyhow::anyhow!("invalid run id"));
+        return error_response(agentd_store::StoreError::Validation(
+            "invalid run id".into(),
+        ));
     };
-    let deadline = tokio::time::Instant::now() + timeout;
+    let Some(deadline) = tokio::time::Instant::now().checked_add(timeout) else {
+        return error_response(agentd_store::StoreError::Validation(
+            "wait timeout is too large".into(),
+        ));
+    };
     loop {
         match state.store.get_run(run_id).await {
             Ok(Some(run)) => {
                 if run.tenant != tenant {
-                    return error_response(anyhow::anyhow!("run not found"));
+                    return error_response(agentd_store::StoreError::NotFound(
+                        "run not found".into(),
+                    ));
                 }
                 let status = run.status;
                 if matches!(
@@ -73,7 +79,7 @@ pub(crate) async fn wait_run(
                         })
                     }));
                 }
-                if tokio::time::Instant::now() >= deadline {
+                if tokio::time::Instant::now() >= deadline || state.supervisor.is_shutting_down() {
                     return (
                         StatusCode::OK,
                         Json(serde_json::json!({
@@ -103,27 +109,21 @@ pub(crate) async fn cancel_run(
     Path((tenant, id)): Path<(String, String)>,
     Json(req): Json<CancelReq>,
 ) -> impl IntoResponse {
-    match parse_uuid(&id) {
-        Ok(run_id) => {
-            if !matches!(state.store.get_run(run_id).await, Ok(Some(run)) if run.tenant == tenant) {
-                return error_response("run not found");
-            }
-            match state
-                .store
-                .cancel_run_request(run_id, req.reason.as_deref().unwrap_or("cancelled"))
-                .await
-            {
-                Ok(status) => {
-                    if let Some(handle) = state.running_tasks.lock().await.remove(&run_id) {
-                        handle.abort();
-                        let _ = handle.await;
-                    }
-                    state.capabilities.cleanup_sandbox_run(run_id).await;
-                    (StatusCode::OK, Json(serde_json::json!({"status": status}))).into_response()
-                }
-                Err(error) => error_response(error),
-            }
-        }
+    let run_id = match parse_uuid(&id) {
+        Ok(run_id) => run_id,
+        Err(error) => return error_response(error),
+    };
+    match state
+        .supervisor
+        .cancel(
+            &state,
+            &tenant,
+            run_id,
+            req.reason.as_deref().unwrap_or("cancelled"),
+        )
+        .await
+    {
+        Ok(status) => (StatusCode::OK, Json(serde_json::json!({"status": status}))).into_response(),
         Err(error) => error_response(error),
     }
 }
@@ -135,6 +135,8 @@ pub(crate) fn parse_status(raw: &str) -> Result<AgentRunStatus> {
         "succeeded" => Ok(AgentRunStatus::Succeeded),
         "failed" => Ok(AgentRunStatus::Failed),
         "cancelled" => Ok(AgentRunStatus::Cancelled),
-        other => Err(anyhow::anyhow!("invalid status: {other}")),
+        other => {
+            Err(agentd_store::StoreError::Validation(format!("invalid status: {other}")).into())
+        }
     }
 }

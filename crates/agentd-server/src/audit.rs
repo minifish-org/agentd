@@ -234,7 +234,7 @@ pub(crate) async fn audit_request(
 mod tests {
     use super::*;
     use crate::{server::build_router, AppState};
-    use agentd_core::{CapabilityEngine, RuntimeEngine};
+    use agentd_core::CapabilityEngine;
     use agentd_store::AuditQuery;
     use axum::{
         body::{to_bytes, Body},
@@ -244,11 +244,10 @@ mod tests {
         Router,
     };
     use std::sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
         Arc,
     };
     use tempfile::TempDir;
-    use tokio::sync::{Mutex, Semaphore};
     use tower::ServiceExt;
 
     async fn fixture(token: Option<&str>) -> (TempDir, AgentdStore, Router) {
@@ -257,15 +256,7 @@ mod tests {
             .await
             .unwrap();
         let capabilities = CapabilityEngine::new(store.clone());
-        let state = AppState {
-            store: store.clone(),
-            capabilities: capabilities.clone(),
-            runtime: RuntimeEngine::new(capabilities, store.clone()),
-            run_permits: Arc::new(Semaphore::new(1)),
-            running_tasks: Arc::new(Mutex::new(Default::default())),
-            dispatch_poll_interval_ms: 25,
-            shutting_down: Arc::new(AtomicBool::new(false)),
-        };
+        let state = AppState::new(store.clone(), capabilities, 1, 25);
         let app = build_router(state, token.map(str::to_owned));
         (dir, store, app)
     }

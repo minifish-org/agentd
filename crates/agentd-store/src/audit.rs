@@ -264,7 +264,9 @@ pub(super) async fn record(tx: &mut db::Transaction, input: AuditInput<'_>) -> R
 fn row_to_event(row: db::SqlRow) -> Result<AuditEvent> {
     let optional_uuid = |name| -> Result<Option<Uuid>> {
         row.try_get::<Option<String>, _>(name)?
-            .map(|value| Uuid::parse_str(&value).map_err(Into::into))
+            .map(|value| {
+                Uuid::parse_str(&value).map_err(|error| StoreError::database(error).into())
+            })
             .transpose()
     };
     Ok(AuditEvent {
@@ -279,7 +281,7 @@ fn row_to_event(row: db::SqlRow) -> Result<AuditEvent> {
         resource_type: row.try_get("resource_type")?,
         resource_id: row.try_get("resource_id")?,
         outcome: row.try_get("outcome")?,
-        details: serde_json::from_str(&row.try_get::<String, _>("details_json")?)?,
+        details: decode_json(&row.try_get::<String, _>("details_json")?)?,
     })
 }
 
@@ -296,13 +298,13 @@ impl AgentdStore {
     pub async fn list_audit_events(&self, filter: &AuditQuery) -> Result<AuditPage> {
         let limit = filter.limit.unwrap_or(50);
         if !(1..=500).contains(&limit) {
-            return Err(anyhow!("audit limit must be between 1 and 500"));
+            return Err(invalid!("audit limit must be between 1 and 500"));
         }
         if filter.before_id.is_some_and(|id| id < 0) {
-            return Err(anyhow!("audit before_id must not be negative"));
+            return Err(invalid!("audit before_id must not be negative"));
         }
         if matches!((filter.since, filter.until), (Some(since), Some(until)) if since > until) {
-            return Err(anyhow!("audit since must not be later than until"));
+            return Err(invalid!("audit since must not be later than until"));
         }
         let fields = [
             ("tenant", filter.tenant.as_deref(), None),

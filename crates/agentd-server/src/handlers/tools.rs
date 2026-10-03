@@ -21,7 +21,7 @@ pub(crate) async fn list_tools(
                 .store
                 .get_agent(&tenant, &agent_name)
                 .await?
-                .ok_or_else(|| anyhow::anyhow!("agent not found"))?;
+                .ok_or_else(|| agentd_store::StoreError::NotFound("agent not found".into()))?;
             let mut tools = state
                 .store
                 .list_visible_tools(&tenant, &agent.spec.effective_allowed_families())

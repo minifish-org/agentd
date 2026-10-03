@@ -56,8 +56,12 @@ async fn schedule(store: &AgentdStore, name: &str, agent: &str, payload: serde_j
 }
 
 async fn due(store: &AgentdStore, name: &str, now: DateTime<Utc>) {
+    // Each call models a new occurrence. A retry retains the original due time.
+    let sequence = events(store, "schedule.trigger").await.len() as i64;
     db::query("UPDATE schedules SET next_trigger_at = ? WHERE tenant = 'demo' AND name = ?")
-        .bind((now - ChronoDuration::seconds(1)).to_rfc3339())
+        .bind(
+            (now - ChronoDuration::seconds(1) + ChronoDuration::nanoseconds(sequence)).to_rfc3339(),
+        )
         .bind(name)
         .execute(&store.pool)
         .await
@@ -394,6 +398,123 @@ async fn scheduler_partial_failure_keeps_committed_runs_and_safe_audit_summary()
         .unwrap();
     assert_eq!(current.last_run_id, Some(runs[0].run_id));
     assert!(current.next_trigger_at.unwrap() > now);
+}
+
+#[tokio::test]
+async fn schedule_summary_retry_reuses_occurrence_and_pending_background_targets() {
+    for agent in ["bot", MEMORY_MAINTAINER_AGENT] {
+        let (_dir, store) = fixture().await;
+        seed_memory(&store, "profile", 5).await;
+        schedule(&store, "retry", agent, json!({"namespace":"profile"})).await;
+        let now = Utc::now();
+        due(&store, "retry", now).await;
+        db::query("CREATE TRIGGER reject_summary BEFORE INSERT ON audit_events WHEN NEW.action = 'schedule.trigger' BEGIN SELECT RAISE(ABORT, 'summary failed'); END")
+            .execute(&store.pool).await.unwrap();
+        assert!(tick(&store, now).await.is_err());
+        let runs = store
+            .list_runs(&RunListQuery {
+                tenant: Some("demo".into()),
+                agent_ref: Some(agent.into()),
+                status: None,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+        assert_eq!(runs.len(), 1);
+        let original = runs[0].run_id;
+        assert!(
+            store
+                .get_schedule("demo", "retry")
+                .await
+                .unwrap()
+                .unwrap()
+                .next_trigger_at
+                .unwrap()
+                <= now
+        );
+        db::query("DROP TRIGGER reject_summary")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert!(tick(&store, now + ChronoDuration::seconds(10))
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .list_runs(&RunListQuery {
+                    tenant: Some("demo".into()),
+                    agent_ref: Some(agent.into()),
+                    status: None,
+                    limit: 10
+                })
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let summary = events(&store, "schedule.trigger").await.remove(0);
+        assert_eq!(summary.details["queued_count"], 1);
+        assert_eq!(summary.details["run_ids"], json!([original]));
+        assert_eq!(
+            store
+                .get_schedule("demo", "retry")
+                .await
+                .unwrap()
+                .unwrap()
+                .last_run_id,
+            Some(original)
+        );
+    }
+}
+
+#[tokio::test]
+async fn occurrence_retry_preserves_committed_targets_removed_from_discovery() {
+    let (_dir, store) = fixture().await;
+    for namespace in ["a", "b"] {
+        seed_memory(&store, namespace, 5).await;
+    }
+    schedule(
+        &store,
+        MEMORY_MAINTENANCE_SCHEDULE,
+        MEMORY_MAINTAINER_AGENT,
+        json!({"namespace":"*"}),
+    )
+    .await;
+    let now = Utc::now();
+    due(&store, MEMORY_MAINTENANCE_SCHEDULE, now).await;
+    db::query("CREATE TRIGGER reject_summary BEFORE INSERT ON audit_events WHEN NEW.action = 'schedule.trigger' BEGIN SELECT RAISE(ABORT, 'summary failed'); END").execute(&store.pool).await.unwrap();
+    assert!(tick(&store, now).await.is_err());
+    let original = store
+        .list_runs(&RunListQuery {
+            tenant: Some("demo".into()),
+            agent_ref: Some(MEMORY_MAINTAINER_AGENT.into()),
+            status: None,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    assert_eq!(original.len(), 2);
+    // A later discovery snapshot no longer contains the first committed target.
+    db::query("DELETE FROM memory WHERE tenant = 'demo' AND namespace = 'a'")
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    db::query("DROP TRIGGER reject_summary")
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    assert!(tick(&store, now + ChronoDuration::seconds(10))
+        .await
+        .unwrap()
+        .is_empty());
+    let summary = events(&store, "schedule.trigger").await.remove(0);
+    assert_eq!(summary.details["target_count"], 2);
+    assert_eq!(summary.details["queued_count"], 2);
+    let ids = summary.details["run_ids"].as_array().unwrap();
+    for run in original {
+        assert!(ids.contains(&json!(run.run_id)));
+    }
 }
 
 #[tokio::test]

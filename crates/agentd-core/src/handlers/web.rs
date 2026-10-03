@@ -2,6 +2,7 @@ use crate::CapabilityEngine;
 use anyhow::{anyhow, Result};
 use regex::Regex;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::LazyLock;
 
 const USER_AGENT: &str = "Mozilla/5.0 (compatible; agentd/1.0)";
 
@@ -90,11 +91,7 @@ impl CapabilityEngine {
         params: &serde_json::Value,
     ) -> Result<serde_json::Value> {
         const MAX_BYTES: usize = 1024 * 1024;
-        let mut url = params
-            .get("url")
-            .and_then(|value| value.as_str())
-            .ok_or_else(|| anyhow!("web_fetch requires url"))?
-            .parse::<url::Url>()?;
+        let mut url = parse_fetch_url(params)?;
         for _ in 0..=5 {
             let (host, addresses) = resolve_public_url(&url).await?;
             let client = reqwest::Client::builder()
@@ -157,13 +154,30 @@ impl CapabilityEngine {
     }
 }
 
-async fn resolve_public_url(url: &url::Url) -> Result<(String, Vec<SocketAddr>)> {
+fn parse_fetch_url(params: &serde_json::Value) -> Result<url::Url> {
+    let url = params
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("web_fetch requires url"))?
+        .parse::<url::Url>()?;
+    http_host(&url)?;
+    Ok(url)
+}
+
+pub(crate) fn validate_fetch_input(params: &serde_json::Value) -> Result<()> {
+    parse_fetch_url(params).map(|_| ())
+}
+
+fn http_host(url: &url::Url) -> Result<&str> {
     if !matches!(url.scheme(), "http" | "https") {
         return Err(anyhow!("web_fetch only supports http and https"));
     }
-    let host = url
-        .host_str()
-        .ok_or_else(|| anyhow!("web_fetch URL has no host"))?;
+    url.host_str()
+        .ok_or_else(|| anyhow!("web_fetch URL has no host"))
+}
+
+async fn resolve_public_url(url: &url::Url) -> Result<(String, Vec<SocketAddr>)> {
+    let host = http_host(url)?;
     let lookup_name = host
         .strip_prefix('[')
         .and_then(|host| host.strip_suffix(']'))
@@ -221,12 +235,19 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
 }
 
 pub(crate) fn extract_html_search_results(body: &str) -> Vec<serde_json::Value> {
-    let link_re =
+    static LINK_RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r#"(?s)<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>"#)
-            .expect("valid link regex");
-    let snippet_re = Regex::new(r#"(?s)<a[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</a>"#)
-        .expect("valid snippet regex");
-    let tag_re = Regex::new(r"<[^>]+>").expect("valid tag regex");
+            .expect("valid link regex")
+    });
+    let link_re = &*LINK_RE;
+    static SNIPPET_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?s)<a[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</a>"#)
+            .expect("valid snippet regex")
+    });
+    let snippet_re = &*SNIPPET_RE;
+    static TAG_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"<[^>]+>").expect("valid tag regex"));
+    let tag_re = &*TAG_RE;
 
     let snippets = snippet_re
         .captures_iter(body)
@@ -271,12 +292,20 @@ pub(crate) fn html_text(input: &str) -> String {
 }
 
 pub(crate) fn extract_visible_html_snapshot(body: &str) -> (String, Option<String>) {
-    let title_re = Regex::new(r#"(?is)<title[^>]*>(.*?)</title>"#).expect("valid title regex");
-    let strip_re = Regex::new(
+    static TITLE_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?is)<title[^>]*>(.*?)</title>"#).expect("valid title regex")
+    });
+    let title_re = &*TITLE_RE;
+    static STRIP_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
         r#"(?is)<(script|style|noscript|svg|canvas|template)[^>]*>.*?</(script|style|noscript|svg|canvas|template)>"#,
     )
-    .expect("valid strip regex");
-    let tag_re = Regex::new(r"(?is)<[^>]+>").expect("valid tag regex");
+    .expect("valid strip regex")
+    });
+    let strip_re = &*STRIP_RE;
+    static TAG_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?is)<[^>]+>").expect("valid tag regex"));
+    let tag_re = &*TAG_RE;
     let title = title_re
         .captures(body)
         .and_then(|caps| caps.get(1))

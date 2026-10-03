@@ -169,7 +169,11 @@ async fn discover_allowed_tools(server: &McpServer) -> anyhow::Result<Vec<McpToo
         .cloned()
         .collect::<Vec<_>>();
     if !unknown.is_empty() {
-        anyhow::bail!("unknown MCP tools in allowed_tools: {}", unknown.join(", "));
+        return Err(agentd_store::StoreError::Validation(format!(
+            "unknown MCP tools in allowed_tools: {}",
+            unknown.join(", ")
+        ))
+        .into());
     }
     let allowed = allowed.iter().map(String::as_str).collect::<BTreeSet<_>>();
     Ok(discovered

@@ -7,9 +7,11 @@ mod config;
 mod dispatch;
 mod handlers;
 mod responses;
+mod runtime_lock;
 mod scheduler;
 mod server;
 mod state;
+mod supervisor;
 mod turns;
 
 pub(crate) use responses::{error_response, json_result, parse_uuid};

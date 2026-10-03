@@ -73,7 +73,7 @@ fn row_to_revision(row: db::SqlRow) -> Result<BehaviorRevision> {
         instructions: row.try_get("instructions")?,
         outcome: row.try_get("outcome")?,
         source_run_id: parse_uuid_field(&row, "source_run_id")?,
-        report: serde_json::from_str(&row.try_get::<String, _>("report_json")?)?,
+        report: decode_json(&row.try_get::<String, _>("report_json")?)?,
         created_at: parse_ts_field(&row, "created_at")?,
     })
 }
@@ -97,7 +97,7 @@ pub(super) async fn active_revision_for_spec(
         return Ok(None);
     }
     let Some(row) = row else { return Ok(None) };
-    let stored_spec: AgentSpec = serde_json::from_str(&row.try_get::<String, _>("spec_json")?)?;
+    let stored_spec: AgentSpec = decode_json(&row.try_get::<String, _>("spec_json")?)?;
     if stored_spec != *spec {
         return Ok(None);
     }
@@ -113,9 +113,9 @@ impl AgentdStore {
         tenant: &str,
         options: &BehaviorLearningOptions,
     ) -> Result<BehaviorLearningReadiness> {
-        options.validate().map_err(|error| anyhow!(error))?;
+        options.validate().map_err(validation)?;
         if options.target_agent == "*" {
-            return Err(anyhow!(
+            return Err(invalid!(
                 "behavior readiness requires a concrete target_agent"
             ));
         }
@@ -182,16 +182,15 @@ impl AgentdStore {
     }
 
     pub(super) async fn ensure_foreground_behavior_target(
-        &self,
+        tx: &mut db::Transaction,
         tenant: &str,
         target_agent: &str,
     ) -> Result<()> {
-        let target = self
-            .get_agent(tenant, target_agent)
+        let target = Self::get_agent_in_tx(tx, tenant, target_agent)
             .await?
-            .ok_or_else(|| anyhow!("learning target agent not found: {target_agent}"))?;
+            .ok_or_else(|| missing!("learning target agent not found: {target_agent}"))?;
         if !is_foreground_agent(&target) {
-            return Err(anyhow!(
+            return Err(invalid!(
                 "behavior learning target must be a foreground agent"
             ));
         }
@@ -285,12 +284,12 @@ impl AgentdStore {
         result: BehaviorLearningResult<'_>,
     ) -> Result<BehaviorRevision> {
         if result.instructions.len() > 4096 {
-            return Err(anyhow!("learned instructions must be at most 4096 bytes"));
+            return Err(invalid!("learned instructions must be at most 4096 bytes"));
         }
         let mut tx = self.pool.begin().await?;
         let run = db::query("SELECT tenant, agent_ref, status, input_json, output_json, delivery_destination, created_at FROM runs WHERE run_id = ?")
             .bind(run_id.to_string()).fetch_optional(&mut tx).await?
-            .ok_or_else(|| anyhow!("learning run not found"))?;
+            .ok_or_else(|| missing!("learning run not found"))?;
         if run.try_get::<String, _>("agent_ref")? != BEHAVIOR_LEARNER_AGENT
             || run.try_get::<String, _>("status")? != "running"
             || run
@@ -302,8 +301,7 @@ impl AgentdStore {
                 "only a running behavior learner without delivery can publish"
             ));
         }
-        let input: serde_json::Value =
-            serde_json::from_str(&run.try_get::<String, _>("input_json")?)?;
+        let input: serde_json::Value = decode_json(&run.try_get::<String, _>("input_json")?)?;
         let target = input.get("target_agent").or_else(|| {
             input
                 .get("input")
@@ -386,7 +384,9 @@ impl AgentdStore {
         let changed = db::query("UPDATE runs SET output_json = ?, error = NULL, status = 'succeeded', updated_at = ? WHERE run_id = ? AND status = 'running'")
             .bind(output.to_string()).bind(now.to_rfc3339()).bind(run_id.to_string()).execute(&mut tx).await?.rows_affected();
         if changed != 1 {
-            return Err(anyhow!("learning run was cancelled during finalization"));
+            return Err(conflicting!(
+                "learning run was cancelled during finalization"
+            ));
         }
         for (kind, payload) in [
             ("output", output),
@@ -1294,7 +1294,10 @@ mod tests {
         let mut all = Vec::new();
         for attempt in 0..2 {
             db::query("UPDATE schedules SET next_trigger_at = ? WHERE tenant = 'one'")
-                .bind((now - ChronoDuration::seconds(1)).to_rfc3339())
+                .bind(
+                    (now - ChronoDuration::seconds(1) + ChronoDuration::nanoseconds(attempt))
+                        .to_rfc3339(),
+                )
                 .execute(&store.pool)
                 .await
                 .unwrap();

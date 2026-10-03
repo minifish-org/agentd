@@ -182,7 +182,7 @@ ID or exact label and walks incoming, outgoing, or both directions for at most
 three hops. It is a separate, read-only, model-selected tool: Graph is not run on
 every semantic search, and no entity extractor or graph database is required.
 
-`memory_list` enumerates one namespace with a host-clamped page size and an
+`memory_list` enumerates one namespace with a bounded page size and an
 opaque cursor bound to the current run's tenant and namespace. It returns only
 IDs, text, and timestamps; use `memory_search` for relevance retrieval.
 
@@ -238,7 +238,8 @@ optional: a turn or schedule must explicitly provide
 `"delivery":{"destination":"tg:42"}`. Scope is never treated as a
 destination. Finalization atomically writes the output, terminal trace, rolling
 context, and—when requested—one pending delivery referencing the run. Delivery
-rows do not copy the output; claim/list responses join it from the run.
+rows capture an immutable payload at terminal commit time, including an
+explicit failure reply for addressed failed runs.
 Adapters acknowledge `delivered`, `retry`, or `failed`; expired claims are
 claimable again and retry updates the same row.
 

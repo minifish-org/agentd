@@ -33,7 +33,7 @@ impl CapabilityEngine {
 
     /// Build an OpenAI-compatible chat-completions request. agentd speaks only
     /// this transport; `params.model` overrides the configured default, and
-    /// `temperature` / `max_tokens` / `response_format` / `thinking` are
+    /// `temperature` / `max_tokens` / `response_format` are
     /// forwarded verbatim when present.
     pub(crate) fn prepare_llm_request(
         &self,

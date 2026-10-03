@@ -18,7 +18,7 @@ Security reports do not belong in public issues. Follow
 
 ## Development setup
 
-The workspace pins Rust 1.92 through `rust-toolchain.toml`. Native runtime use
+The workspace pins Rust 1.94 through `rust-toolchain.toml`. Native runtime use
 also needs `curl`, an OpenAI-compatible chat-completions provider, and the
 pinned retrieval assets:
 

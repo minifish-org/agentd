@@ -26,6 +26,10 @@ include a server-generated `X-Request-Id` linking request and mutation records.
 Audit query, identity, privacy, failure and retention semantics are documented
 in [audit history](audit.md). Auditing does not require or create agent runs.
 
+Invalid input returns `400`, missing resources return `404`, conflicting
+resource state returns `409`, and internal failures return `500`. Audit storage
+failures retain the documented `503` semantics.
+
 Turn input:
 
 ```json
@@ -116,13 +120,14 @@ Replacing or deleting the memory replaces or removes its graph contribution.
 
 The agent-only `graph_query` tool is in the memory capability family and uses
 the same default namespace rules. It matches an entity ID or exact label, can
-filter one relation, traverses `outgoing`, `incoming`, or `both`, and clamps
-`max_hops` to `1..=3` and results to 100 paths. It is selected independently by
+filter one relation and traverses `outgoing`, `incoming`, or `both`. When supplied,
+tool arguments require `max_hops` in `1..=3` and `limit` in `1..=100`; storage also
+bounds traversal and results. It is selected independently by
 the model; `memory_search` does not automatically run Graph, and Graph does not
 invoke embedding or reranking.
 
 The agent-only `memory_list` tool enumerates one namespace in ID order. Its
-limit is clamped to `1..=100`; `next_cursor=null` marks completion. Cursors are
+limit must be in `1..=100`; `next_cursor=null` marks completion. Cursors are
 opaque and bound to the current run's tenant and requested namespace. List
 items contain ID, text, and timestamps, never embeddings or database row IDs.
 
@@ -205,5 +210,6 @@ Delivery ack:
 ```
 
 Expired or incorrect tokens are rejected. Retry returns the same row to
-`pending` and increments its attempt counter. Delivery rows store no payload
-copy; list and claim join `payload` from the referenced run output.
+`pending` and increments its attempt counter. Delivery rows capture an immutable
+terminal payload; list and claim return that payload for both successful and
+explicitly addressed failed runs.

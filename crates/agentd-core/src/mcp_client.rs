@@ -21,7 +21,7 @@ const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
     &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
 type SessionSlot = Arc<Mutex<Option<HttpSession>>>;
-type SessionMap = Arc<Mutex<HashMap<String, SessionSlot>>>;
+type SessionMap = Arc<Mutex<HashMap<(String, String), SessionSlot>>>;
 
 #[derive(Clone)]
 pub(crate) struct McpClient {
@@ -31,6 +31,7 @@ pub(crate) struct McpClient {
 
 #[derive(Debug)]
 struct HttpSession {
+    generation: uuid::Uuid,
     session_id: Option<String>,
     protocol_version: String,
     next_id: u64,
@@ -77,16 +78,18 @@ impl McpClient {
                 let slot = self
                     .session_slot(&target.server.tenant, &target.server.name)
                     .await;
-                let mut session = slot.lock().await;
                 for attempt in 0..2 {
-                    if session.is_none() {
-                        *session = Some(initialize_http(&self.http, url, &headers).await?);
-                    }
-                    let (session_id, protocol_version, request_id) = {
+                    // Serialize initialization and request ID allocation, not network calls.
+                    let (generation, session_id, protocol_version, request_id) = {
+                        let mut session = slot.lock().await;
+                        if session.is_none() {
+                            *session = Some(initialize_http(&self.http, url, &headers).await?);
+                        }
                         let active = session.as_mut().expect("session was initialized");
                         let request_id = active.next_id;
                         active.next_id += 1;
                         (
+                            active.generation,
                             active.session_id.clone(),
                             active.protocol_version.clone(),
                             request_id,
@@ -110,8 +113,13 @@ impl McpClient {
                     {
                         Ok(response) => {
                             if let Some(updated_session_id) = response.session_id {
-                                session.as_mut().expect("session exists").session_id =
-                                    Some(updated_session_id);
+                                let mut session = slot.lock().await;
+                                if let Some(active) = session
+                                    .as_mut()
+                                    .filter(|active| active.generation == generation)
+                                {
+                                    active.session_id = Some(updated_session_id);
+                                }
                             }
                             let result = response
                                 .result
@@ -122,7 +130,13 @@ impl McpClient {
                             if attempt == 0
                                 && error.downcast_ref::<HttpSessionExpired>().is_some() =>
                         {
-                            *session = None;
+                            let mut session = slot.lock().await;
+                            if session
+                                .as_ref()
+                                .is_some_and(|active| active.generation == generation)
+                            {
+                                *session = None;
+                            }
                         }
                         Err(error) => return Err(error),
                     }
@@ -137,6 +151,13 @@ impl McpClient {
             .lock()
             .await
             .remove(&session_key(tenant, name));
+    }
+
+    pub(crate) async fn invalidate_tenant(&self, tenant: &str) {
+        self.sessions
+            .lock()
+            .await
+            .retain(|(active_tenant, _), _| active_tenant != tenant);
     }
 
     async fn session_slot(&self, tenant: &str, name: &str) -> SessionSlot {
@@ -230,6 +251,7 @@ async fn initialize_http(
         session_id = initialized.session_id;
     }
     Ok(HttpSession {
+        generation: uuid::Uuid::new_v4(),
         session_id,
         protocol_version,
         next_id: 2,
@@ -562,8 +584,8 @@ async fn shutdown_stdio(mut child: Child, stdin: ChildStdin) {
     }
 }
 
-fn session_key(tenant: &str, name: &str) -> String {
-    format!("{tenant}\0{name}")
+fn session_key(tenant: &str, name: &str) -> (String, String) {
+    (tenant.to_string(), name.to_string())
 }
 
 async fn send_json(stdin: &mut ChildStdin, value: &Value) -> Result<()> {
@@ -741,6 +763,8 @@ mod tests {
         initializes: Arc<AtomicUsize>,
         calls: Arc<AtomicUsize>,
         expire_first_call: Arc<AtomicBool>,
+        expire_session_one: Arc<AtomicBool>,
+        call_barrier: Option<Arc<tokio::sync::Barrier>>,
     }
 
     async fn session_mcp(
@@ -773,8 +797,17 @@ mod tests {
         );
         if method == Some("tools/call") {
             let call = state.calls.fetch_add(1, Ordering::SeqCst);
-            if call == 0 && state.expire_first_call.load(Ordering::SeqCst) {
+            if (call == 0 && state.expire_first_call.load(Ordering::SeqCst))
+                || (state.expire_session_one.load(Ordering::SeqCst)
+                    && headers
+                        .get("mcp-session-id")
+                        .and_then(|value| value.to_str().ok())
+                        == Some("session-1"))
+            {
                 return StatusCode::NOT_FOUND.into_response();
+            }
+            if let Some(barrier) = &state.call_barrier {
+                barrier.wait().await;
             }
         }
         Json(json!({
@@ -853,6 +886,50 @@ mod tests {
 
         assert_eq!(state.initializes.load(Ordering::SeqCst), 2);
         assert_eq!(state.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn http_calls_share_initialization_without_serializing_network_requests() {
+        for expire_session_one in [false, true] {
+            let state = SessionServer {
+                call_barrier: Some(Arc::new(tokio::sync::Barrier::new(4))),
+                ..SessionServer::default()
+            };
+            state
+                .expire_session_one
+                .store(expire_session_one, Ordering::SeqCst);
+            let address = start_session_server(state.clone()).await;
+            let target = http_target(address, "concurrent");
+            let client = McpClient::new(Duration::from_secs(2));
+            let mut calls = tokio::task::JoinSet::new();
+            for _ in 0..4 {
+                let client = client.clone();
+                let target = target.clone();
+                calls.spawn(async move { client.call_tool(&target, &json!({})).await });
+            }
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while let Some(result) = calls.join_next().await {
+                    result.unwrap().unwrap();
+                }
+            })
+            .await
+            .expect("independent calls should reach the server barrier concurrently");
+            assert_eq!(
+                state.initializes.load(Ordering::SeqCst),
+                if expire_session_one { 2 } else { 1 }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tenant_invalidation_preserves_other_tenants() {
+        let client = McpClient::new(MCP_REQUEST_TIMEOUT);
+        client.session_slot("a", "one").await;
+        client.session_slot("ab", "two").await;
+        client.invalidate_tenant("a").await;
+        let sessions = client.sessions.lock().await;
+        assert!(!sessions.contains_key(&session_key("a", "one")));
+        assert!(sessions.contains_key(&session_key("ab", "two")));
     }
 
     #[tokio::test]

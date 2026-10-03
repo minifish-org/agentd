@@ -25,7 +25,7 @@ use crate::handlers::tools::list_tools;
 use crate::handlers::turns::submit_turn_endpoint;
 use crate::scheduler::Scheduler;
 use crate::state::AppState;
-use agentd_core::{CapabilityEngine, CapabilityEngineConfig, RuntimeEngine};
+use agentd_core::{CapabilityEngine, CapabilityEngineConfig};
 use agentd_store::{with_audit_context, AgentdStore, AuditContext, AuditInput};
 use anyhow::{Context, Result};
 use axum::{
@@ -34,16 +34,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use std::{
-    collections::HashMap,
-    net::SocketAddr,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    time::Duration,
-};
-use tokio::sync::{Mutex, Semaphore};
+use std::{future::IntoFuture, net::SocketAddr, time::Duration};
 use tracing::info;
 
 pub(crate) async fn run_server(config_path: &str, reset_data: bool) -> Result<()> {
@@ -52,12 +43,24 @@ pub(crate) async fn run_server(config_path: &str, reset_data: bool) -> Result<()
     cfg.resolve_runtime_paths()?;
     let rest_listener = cfg.rest_listener()?;
 
-    let database_path = std::path::Path::new(&cfg.database_path);
-    if let Some(parent) = database_path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("failed to create database directory {}", parent.display()))?;
-    }
+    // Acquire both resources before resetting, migrating or recovering data.
+    let listener = tokio::net::TcpListener::bind(rest_listener).await?;
+    let ownership =
+        crate::runtime_lock::acquire_database_lock(std::path::Path::new(&cfg.database_path))?;
+    cfg.database_path = ownership
+        .database_path
+        .to_str()
+        .context("canonical database path must be UTF-8")?
+        .to_owned();
+    let mut sandbox_config = cfg.sandbox_runtime_config()?;
+    let _sandbox_ownership = match sandbox_config.as_mut() {
+        Some(config) => {
+            let ownership = crate::runtime_lock::acquire_sandbox_lock(&config.state_dir)?;
+            config.state_dir = ownership.state_dir.clone();
+            Some(ownership)
+        }
+        None => None,
+    };
     if reset_data {
         for path in [
             cfg.database_path.clone(),
@@ -90,7 +93,7 @@ pub(crate) async fn run_server(config_path: &str, reset_data: bool) -> Result<()
     })
     .await?;
     bootstrap_background_presets(&store).await?;
-    let sandbox_manager = match cfg.sandbox_runtime_config()? {
+    let sandbox_manager = match sandbox_config {
         Some(config) => Some(
             agentd_core::SandboxSessionManager::new_microsandbox(config)
                 .await
@@ -123,33 +126,20 @@ pub(crate) async fn run_server(config_path: &str, reset_data: bool) -> Result<()
     }
     caps.warm_up_retrieval_models().await?;
 
-    let runtime = RuntimeEngine::new(caps.clone(), store.clone());
-    let scheduler = Scheduler::new(
+    let app_state = AppState::new(
         store.clone(),
-        Duration::from_millis(cfg.scheduler_tick_ms.max(100)),
+        caps,
+        cfg.run_concurrency.unwrap_or(4).max(1),
+        cfg.dispatch_poll_interval_ms.unwrap_or(250).max(25),
     );
-    let scheduler_task = tokio::spawn(scheduler.run_forever());
-
-    let app_state = AppState {
-        store: store.clone(),
-        capabilities: caps,
-        runtime,
-        run_permits: Arc::new(Semaphore::new(cfg.run_concurrency.unwrap_or(4).max(1))),
-        running_tasks: Arc::new(Mutex::new(HashMap::new())),
-        dispatch_poll_interval_ms: cfg.dispatch_poll_interval_ms.unwrap_or(250).max(25),
-        shutting_down: Arc::new(AtomicBool::new(false)),
-    };
-
     with_audit_context(
         AuditContext::system("mcp_discovery"),
         rediscover_enabled_servers(&app_state),
     )
     .await;
-    tokio::spawn(run_local_dispatch_loop(app_state.clone()));
 
     let router = build_router(app_state.clone(), cfg.api_token.clone());
 
-    let listener = tokio::net::TcpListener::bind(rest_listener).await?;
     with_audit_context(
         AuditContext::system("startup"),
         store.append_audit(AuditInput::new(
@@ -162,26 +152,56 @@ pub(crate) async fn run_server(config_path: &str, reset_data: bool) -> Result<()
         )),
     )
     .await?;
-    let shutdown_state = app_state.clone();
+    let mut scheduler_task = tokio::spawn(
+        Scheduler::new(
+            store.clone(),
+            Duration::from_millis(cfg.scheduler_tick_ms.max(100)),
+        )
+        .run_forever(),
+    );
+    let mut dispatcher_task = tokio::spawn(run_local_dispatch_loop(app_state.clone()));
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
     let rest = axum::serve(
         listener,
         router.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(async move {
-        shutdown_signal().await;
-        scheduler_task.abort();
-        let _ = scheduler_task.await;
-        shutdown_local_runtime(&shutdown_state).await;
-    });
+    .with_graceful_shutdown(async {
+        let _ = stop_rx.await;
+    })
+    .into_future();
+    tokio::pin!(rest);
     info!(rest = %cfg.rest_addr, "agentd single-host runtime listening");
-    let result = rest.await;
-    with_audit_context(
-        AuditContext::system("shutdown"),
-        app_state.capabilities.cleanup_all_sandboxes(),
-    )
-    .await;
+    let (result, completed) = tokio::select! {
+        result = &mut rest => (result.map_err(anyhow::Error::from), "rest"),
+        _ = shutdown_signal() => (Ok(()), "signal"),
+        result = &mut dispatcher_task => (Err(background_exit("dispatcher", result)), "dispatcher"),
+        result = &mut scheduler_task => (Err(background_exit("scheduler", result)), "scheduler"),
+    };
+    let _ = stop_tx.send(());
+    scheduler_task.abort();
+    if completed != "scheduler" {
+        let _ = scheduler_task.await;
+    }
+    // The supervisor first closes admission and waits for an in-flight claim
+    // to register. Aborting the dispatcher sooner could strand a committed
+    // assignment between its database claim and registration.
+    let shutdown_result = shutdown_local_runtime(&app_state).await;
+    dispatcher_task.abort();
+    if completed != "dispatcher" {
+        let _ = dispatcher_task.await;
+    }
+    if completed != "rest" {
+        rest.await?;
+    }
     result?;
-    Ok(())
+    shutdown_result
+}
+
+fn background_exit(name: &str, result: Result<(), tokio::task::JoinError>) -> anyhow::Error {
+    match result {
+        Ok(()) => anyhow::anyhow!("{name} stopped unexpectedly"),
+        Err(error) => anyhow::anyhow!("{name} task failed: {error}"),
+    }
 }
 
 async fn bootstrap_background_presets(store: &AgentdStore) -> Result<()> {
@@ -218,17 +238,9 @@ async fn bootstrap_background_presets(store: &AgentdStore) -> Result<()> {
     }).await
 }
 
-async fn shutdown_local_runtime(state: &AppState) {
+async fn shutdown_local_runtime(state: &AppState) -> Result<()> {
     with_audit_context(AuditContext::system("shutdown"), async {
-        state.shutting_down.store(true, Ordering::SeqCst);
-        let handles: Vec<_> = state
-            .running_tasks
-            .lock()
-            .await
-            .drain()
-            .map(|(_, task)| task)
-            .collect();
-        if state
+        let audit_start = state
             .store
             .append_audit(AuditInput::new(
                 None,
@@ -236,35 +248,29 @@ async fn shutdown_local_runtime(state: &AppState) {
                 "server",
                 None,
                 "started",
-                serde_json::json!({"active_runs":handles.len()}),
+                serde_json::json!({}),
             ))
-            .await
-            .is_err()
-        {
-            tracing::error!("server shutdown start audit could not be persisted");
-        }
-        for handle in handles {
-            handle.abort();
-            let _ = handle.await;
-        }
-        state.capabilities.cleanup_all_sandboxes().await;
-        if state
+            .await;
+        let result = state.supervisor.shutdown(state).await;
+        state
             .store
             .append_audit(AuditInput::new(
                 None,
                 "server.shutdown",
                 "server",
                 None,
-                "succeeded",
+                if result.is_ok() {
+                    "succeeded"
+                } else {
+                    "failed"
+                },
                 serde_json::json!({}),
             ))
-            .await
-            .is_err()
-        {
-            tracing::error!("server shutdown completion audit could not be persisted");
-        }
+            .await?;
+        audit_start?;
+        result
     })
-    .await;
+    .await
 }
 
 async fn shutdown_signal() {
@@ -384,21 +390,122 @@ mod tests {
     use tempfile::TempDir;
     use tower::ServiceExt;
 
+    async fn startup_config(dir: &TempDir, address: SocketAddr) -> (String, AgentdStore) {
+        let database = dir.path().join("existing.db");
+        let store = AgentdStore::new(database.to_str().unwrap()).await.unwrap();
+        store
+            .create_tenant("preserved", &json!({"marker":"keep"}))
+            .await
+            .unwrap();
+        let config = dir.path().join("agentd.toml");
+        let config_text = format!(
+            "rest_addr = \"{address}\"\ndatabase_path = \"{}\"\nscheduler_tick_ms = 1000\n",
+            database.display()
+        );
+        std::fs::write(&config, config_text).unwrap();
+        (config.to_string_lossy().into_owned(), store)
+    }
+
+    fn database_files(dir: &TempDir) -> Vec<Option<Vec<u8>>> {
+        ["existing.db", "existing.db-wal"]
+            .iter()
+            .map(|name| std::fs::read(dir.path().join(name)).ok())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn busy_listener_does_not_reset_or_initialize_existing_database() {
+        let dir = TempDir::new().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (config, store) = startup_config(&dir, listener.local_addr().unwrap()).await;
+        let before = database_files(&dir);
+        assert!(run_server(&config, true).await.is_err());
+        assert_eq!(database_files(&dir), before);
+        assert_eq!(
+            store
+                .get_tenant("preserved")
+                .await
+                .unwrap()
+                .unwrap()
+                .metadata,
+            json!({"marker":"keep"})
+        );
+        assert!(store
+            .list_agents(Some("preserved"))
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn duplicate_database_owner_on_another_port_cannot_reset_database() {
+        let dir = TempDir::new().unwrap();
+        let (config, store) = startup_config(&dir, "127.0.0.1:0".parse().unwrap()).await;
+        let _owner =
+            crate::runtime_lock::acquire_database_lock(&dir.path().join("existing.db")).unwrap();
+        let before = database_files(&dir);
+        let error = run_server(&config, true).await.unwrap_err();
+        assert_eq!(database_files(&dir), before);
+        assert!(error.to_string().contains("already owned"));
+        assert_eq!(
+            store
+                .get_tenant("preserved")
+                .await
+                .unwrap()
+                .unwrap()
+                .metadata,
+            json!({"marker":"keep"})
+        );
+        assert!(store
+            .list_agents(Some("preserved"))
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn shared_sandbox_owner_rejects_another_database_before_mutating_it() {
+        let dir = TempDir::new().unwrap();
+        let (config, store) = startup_config(&dir, "127.0.0.1:0".parse().unwrap()).await;
+        let state_dir = dir.path().join("sandbox");
+        let _other_database_runtime =
+            crate::runtime_lock::acquire_sandbox_lock(&state_dir).unwrap();
+        let settings = format!(
+            "\n[sandbox]\nenabled = true\nimage = \"unused-test-image\"\nstate_dir = \"{}\"\n",
+            state_dir.display()
+        );
+        std::fs::write(
+            &config,
+            std::fs::read_to_string(&config).unwrap() + &settings,
+        )
+        .unwrap();
+        let before = database_files(&dir);
+        let error = run_server(&config, true).await.unwrap_err();
+        assert!(error.to_string().contains("already owned"));
+        assert_eq!(database_files(&dir), before);
+        assert_eq!(
+            store
+                .get_tenant("preserved")
+                .await
+                .unwrap()
+                .unwrap()
+                .metadata,
+            json!({"marker":"keep"})
+        );
+        assert!(store
+            .list_agents(Some("preserved"))
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
     async fn app() -> (TempDir, Router) {
         let dir = TempDir::new().unwrap();
         let store = AgentdStore::new(dir.path().join("agentd.db").to_str().unwrap())
             .await
             .unwrap();
         let caps = CapabilityEngine::new(store.clone());
-        let state = AppState {
-            store: store.clone(),
-            capabilities: caps.clone(),
-            runtime: RuntimeEngine::new(caps, store.clone()),
-            run_permits: Arc::new(Semaphore::new(2)),
-            running_tasks: Arc::new(Mutex::new(HashMap::new())),
-            dispatch_poll_interval_ms: 25,
-            shutting_down: Arc::new(AtomicBool::new(false)),
-        };
+        let state = AppState::new(store, caps, 2, 25);
         (dir, build_router(state, None))
     }
 

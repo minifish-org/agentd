@@ -20,11 +20,25 @@ REST turn / due schedule
 
 - The model chooses real tools and the final JSON; host code validates and
   executes.
+- Runtime tool calls and offline learning decisions share compiled schema
+  validation and the built-ins' pure parameter checks. Validators are cached
+  within a bounded cache. Local schema references are supported; validation
+  never retrieves schemas from the network or filesystem.
 - Tenant ownership applies to agents, runs, context, artifacts, memory and its
   graph projection, schedules, MCP servers, deliveries, and behavior policies
   and revision history.
 - Scope is both the rolling-context key and serialization key. Different
   scopes may run concurrently.
+- Startup acquires the listener and exclusive ownership of the database and,
+  when enabled, the sandbox state directory before resetting data or recovering
+  interrupted runs. Only the process holding these locks may run the local
+  scheduler, dispatcher and sandbox reaper.
+- A run supervisor owns execution tasks and observes their completion,
+  including panics. Cancellation and shutdown stop execution, persist a
+  terminal state, and release run-scoped sandbox resources. Deleting a tenant
+  also stops its active tasks before deleting their stored state. Failed
+  sandbox destruction remains retryable and prevents tenant deletion from
+  reporting success. Shutdown waits for detached cancellation and deletion.
 - Context is a bounded conversation window; memory is explicit durable text
   with lexical and semantic derived indexes; artifacts are payloads; `run_log`
   is the raw execution trace.
@@ -61,7 +75,7 @@ versions 6–10 in place; unknown versions request `--reset-data`.
 Important facts are stored once. Runs own activation, final output, and an
 optional requested destination; `run_log` owns model/tool/output/status/error
 observations; contexts own recent messages; deliveries reference runs and own
-only remote delivery state and retry fields. There are no
+an immutable terminal payload, remote delivery state, and retry fields. There are no
 activation, receipt, worker, step, side-effect, token, lease, RAG metadata, or
 replay tables.
 
@@ -100,6 +114,19 @@ resources with enabled schedules; startup fills missing resources for existing
 tenants. Compatible custom settings and explicit disabled schedules survive
 both paths. The memory maintainer is an ordinary tenant agent whose eligible
 work enters the queued run, claim, native tool loop, and `run_log` path.
+
+Each scheduled target has a stable occurrence identity bound to the stored
+due time, schedule incarnation and specification, and target. A tick reuses
+already committed runs after an interrupted fan-out or failed summary commit;
+it does not queue the same occurrence twice. Schedule advancement checks that
+the schedule has not changed since planning. Preset repairs likewise check
+their resource snapshots before committing agent and schedule changes together.
+
+The store keeps one public facade with internal modules for database access,
+migrations, resources, retrieval, runs, deliveries, and schedules. Cross-resource
+operations own their transactions explicitly; splitting modules does not split
+run finalization into separate commits. Semantic ranking reads bounded batches
+from one database snapshot and retains only the best candidates in memory.
 
 A memory namespace becomes eligible when it has at least `min_entries` entries
 (five by default) and an external content revision newer than its successful

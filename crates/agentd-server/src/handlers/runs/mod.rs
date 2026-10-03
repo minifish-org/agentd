@@ -42,7 +42,9 @@ pub(crate) async fn get_run_trace(
     };
     match state.store.get_run(run_id).await {
         Ok(Some(run)) if run.tenant == tenant => {}
-        Ok(Some(_)) | Ok(None) => return error_response("run not found"),
+        Ok(Some(_)) | Ok(None) => {
+            return error_response(agentd_store::StoreError::NotFound("run not found".into()))
+        }
         Err(error) => return error_response(error),
     }
     match state.store.list_run_log(run_id).await {

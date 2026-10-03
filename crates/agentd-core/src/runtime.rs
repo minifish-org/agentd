@@ -357,33 +357,8 @@ impl RuntimeEngine {
                 request["model"] = json!(model);
             }
 
-            self.store
-                .append_event(
-                    run.run_id,
-                    "model",
-                    json!({"phase":"request", "step":step, "request":request}),
-                    Utc::now(),
-                )
-                .await?;
-            let response =
-                match self.caps.chat_completion(&request).await {
-                    Ok(response) => response,
-                    Err(error) => {
-                        self.store.append_event(
-                        run.run_id, "model",
-                        json!({"phase":"error","step":step,"reason":"model_request_failed"}),
-                        Utc::now(),
-                    ).await?;
-                        return Err(error);
-                    }
-                };
-            self.store
-                .append_event(
-                    run.run_id,
-                    "model",
-                    json!({"phase":"response", "step":step, "response":response}),
-                    Utc::now(),
-                )
+            let response = self
+                .traced_completion(run.run_id, step, None, &request, context.deadline)
                 .await?;
 
             let choice = response

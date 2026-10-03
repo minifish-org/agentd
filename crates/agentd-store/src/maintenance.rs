@@ -38,7 +38,7 @@ pub fn memory_maintenance_min_entries(payload: &serde_json::Value) -> Result<usi
     let value = value
         .as_u64()
         .filter(|value| (2..=10_000).contains(value))
-        .ok_or_else(|| anyhow!("memory maintenance min_entries must be between 2 and 10000"))?;
+        .ok_or_else(|| invalid!("memory maintenance min_entries must be between 2 and 10000"))?;
     Ok(value as usize)
 }
 
@@ -47,10 +47,10 @@ pub(super) fn maintenance_namespace(input: &serde_json::Value) -> Result<String>
         .get("namespace")
         .or_else(|| input.pointer("/input/namespace"))
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| anyhow!("memory maintainer input requires a namespace"))?;
+        .ok_or_else(|| invalid!("memory maintainer input requires a namespace"))?;
     let namespace = normalize_memory_component(namespace, "namespace")?;
     if namespace == ALL_MEMORY_NAMESPACES {
-        return Err(anyhow!(
+        return Err(invalid!(
             "memory maintenance runs require a concrete namespace"
         ));
     }
@@ -64,7 +64,7 @@ async fn readiness(
     min_entries: usize,
 ) -> Result<MemoryMaintenanceReadiness> {
     if !(2..=10_000).contains(&min_entries) {
-        return Err(anyhow!(
+        return Err(invalid!(
             "memory maintenance min_entries must be between 2 and 10000"
         ));
     }
@@ -137,7 +137,7 @@ impl AgentdStore {
                 .bind(run_id.to_string())
                 .fetch_optional(&mut tx)
                 .await?
-                .ok_or_else(|| anyhow!("memory maintenance run not found"))?;
+                .ok_or_else(|| missing!("memory maintenance run not found"))?;
         if run.try_get::<String, _>("agent_ref")? != MEMORY_MAINTAINER_AGENT
             || run.try_get::<String, _>("status")? != "running"
         {
@@ -146,8 +146,7 @@ impl AgentdStore {
             ));
         }
         let tenant = run.try_get::<String, _>("tenant")?;
-        let input: serde_json::Value =
-            serde_json::from_str(&run.try_get::<String, _>("input_json")?)?;
+        let input: serde_json::Value = decode_json(&run.try_get::<String, _>("input_json")?)?;
         let namespace = maintenance_namespace(&input)?;
         let state = readiness(&mut tx, &tenant, &namespace, min_entries).await?;
         if state.ready {
@@ -190,7 +189,7 @@ pub(super) async fn record_memory_change(
                 .bind(run_id.to_string())
                 .fetch_optional(&mut *tx)
                 .await?
-                .ok_or_else(|| anyhow!("memory write source run not found"))?;
+                .ok_or_else(|| missing!("memory write source run not found"))?;
         if run.try_get::<String, _>("tenant")? != tenant
             || run.try_get::<String, _>("status")? != "running"
         {
@@ -199,8 +198,7 @@ pub(super) async fn record_memory_change(
             ));
         }
         if run.try_get::<String, _>("agent_ref")? == MEMORY_MAINTAINER_AGENT {
-            let input: serde_json::Value =
-                serde_json::from_str(&run.try_get::<String, _>("input_json")?)?;
+            let input: serde_json::Value = decode_json(&run.try_get::<String, _>("input_json")?)?;
             if maintenance_namespace(&input)? != namespace {
                 return Err(anyhow!(
                     "memory maintainer cannot write outside its input namespace"
@@ -222,7 +220,7 @@ pub(super) async fn record_memory_change(
             if prepared.try_get::<i64, _>("start_revision")?
                 != prepared.try_get::<i64, _>("external_revision")?
             {
-                return Err(anyhow!(
+                return Err(conflicting!(
                     "memory changed during maintenance; retry with a fresh scan"
                 ));
             }

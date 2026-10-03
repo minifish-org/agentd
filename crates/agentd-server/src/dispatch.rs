@@ -2,7 +2,7 @@ use crate::AppState;
 use agentd_api::AgentRunStatus;
 use anyhow::Result;
 use chrono::Utc;
-use std::{sync::atomic::Ordering, time::Duration};
+use std::time::Duration;
 
 pub(crate) async fn run_local_dispatch_loop(state: AppState) {
     agentd_store::with_audit_context(
@@ -15,61 +15,22 @@ pub(crate) async fn run_local_dispatch_loop(state: AppState) {
 async fn dispatch_loop(state: AppState) {
     let mut interval =
         tokio::time::interval(Duration::from_millis(state.dispatch_poll_interval_ms));
-    loop {
-        if state.shutting_down.load(Ordering::SeqCst) {
-            break;
-        }
+    while !state.supervisor.is_shutting_down() {
         interval.tick().await;
         loop {
-            if state.shutting_down.load(Ordering::SeqCst) {
-                break;
-            }
-            let Ok(permit) = state.run_permits.clone().try_acquire_owned() else {
-                break;
-            };
-            let assigned = match state.store.claim_next_run().await {
-                Ok(Some(assigned)) => assigned,
-                Ok(None) => break,
+            match state.supervisor.dispatch_next(&state).await {
+                Ok(true) => {}
+                Ok(false) => break,
                 Err(error) => {
-                    tracing::error!(error = %error, "failed to claim next run");
+                    tracing::error!(%error, "failed to dispatch next run");
                     break;
                 }
-            };
-            let run_id = assigned.run.run_id;
-            let task_state = state.clone();
-            let (start_tx, start_rx) = tokio::sync::oneshot::channel();
-            let handle = tokio::spawn(async move {
-                let _permit = permit;
-                if start_rx.await.is_err() {
-                    return;
-                }
-                agentd_store::with_audit_context(
-                    agentd_store::AuditContext::system("dispatcher"),
-                    async {
-                        let execution = execute_local_run_if_running(task_state.clone(), assigned).await;
-                        if let Err(error) = execution {
-                            tracing::error!(run_id = %run_id, error = %error, "local run execution failed");
-                            let _ = task_state.store.fail_run(run_id, &error.to_string()).await;
-                        }
-                    },
-                ).await;
-                task_state.running_tasks.lock().await.remove(&run_id);
-            });
-            let mut running_tasks = state.running_tasks.lock().await;
-            if state.shutting_down.load(Ordering::SeqCst) {
-                handle.abort();
-                drop(running_tasks);
-                let _ = state.store.fail_run(run_id, "server shutting down").await;
-                break;
             }
-            running_tasks.insert(run_id, handle);
-            drop(running_tasks);
-            let _ = start_tx.send(());
         }
     }
 }
 
-async fn execute_local_run_if_running(
+pub(crate) async fn execute_local_run_if_running(
     state: AppState,
     assigned: agentd_store::AssignedRun,
 ) -> Result<()> {
@@ -98,33 +59,14 @@ pub(crate) async fn execute_local_run(
             Utc::now(),
         )
         .await?;
-    let report = match tokio::time::timeout(
+    let report = tokio::time::timeout(
         Duration::from_millis(assigned.timeout_ms.max(1)),
         state.runtime.execute_assigned_run(&assigned),
     )
     .await
-    {
-        Ok(report) => report,
-        Err(_) => {
-            state
-                .capabilities
-                .cleanup_sandbox_run(assigned.run.run_id)
-                .await;
-            state
-                .store
-                .fail_run(assigned.run.run_id, "run timeout exceeded")
-                .await?;
-            return Ok(());
-        }
-    };
-    state
-        .capabilities
-        .cleanup_sandbox_run(assigned.run.run_id)
-        .await;
-    let report = report?;
+    .map_err(|_| anyhow::anyhow!("run timeout exceeded"))??;
     if let Some(error) = report.error {
-        state.store.fail_run(assigned.run.run_id, &error).await?;
-        return Ok(());
+        anyhow::bail!(error);
     }
     Ok(())
 }
@@ -133,12 +75,11 @@ pub(crate) async fn execute_local_run(
 mod tests {
     use super::*;
     use agentd_api::{AgentLimits, AgentResource, AgentSpec, ResourceMeta};
-    use agentd_core::{CapabilityEngine, RuntimeEngine};
+    use agentd_core::CapabilityEngine;
     use agentd_store::NewRun;
     use serde_json::json;
-    use std::{collections::BTreeMap, sync::Arc};
+    use std::collections::BTreeMap;
     use tempfile::TempDir;
-    use tokio::sync::{Mutex, Semaphore};
 
     #[tokio::test]
     async fn cancelled_assignment_is_not_executed_after_dispatch_registration() {
@@ -189,15 +130,7 @@ mod tests {
             .await
             .unwrap();
         let capabilities = CapabilityEngine::new(store.clone());
-        let state = AppState {
-            store: store.clone(),
-            capabilities: capabilities.clone(),
-            runtime: RuntimeEngine::new(capabilities, store.clone()),
-            run_permits: Arc::new(Semaphore::new(1)),
-            running_tasks: Arc::new(Mutex::new(Default::default())),
-            dispatch_poll_interval_ms: 1,
-            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        };
+        let state = AppState::new(store.clone(), capabilities, 1, 1);
 
         execute_local_run_if_running(state, assigned).await.unwrap();
 

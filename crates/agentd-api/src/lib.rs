@@ -1,5 +1,4 @@
 use chrono::{DateTime, Utc};
-use chrono_tz::Tz;
 use croner::Cron;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -7,12 +6,16 @@ use std::str::FromStr;
 use thiserror::Error;
 use uuid::Uuid;
 
+mod artifact;
 mod builtin_catalog;
 mod delivery;
 mod learning;
+mod timezone;
+pub use artifact::{ArtifactPath, ArtifactRef};
 pub use builtin_catalog::{builtin_tool_catalog, visible_tools};
 pub use delivery::*;
 pub use learning::*;
+pub use timezone::{parse_timezone_offset, validate_timezone_name, ResolvedTimezone};
 
 pub const MEMORY_MAINTAINER_AGENT: &str = "system/memory-maintainer";
 pub const MEMORY_MAINTENANCE_SCHEDULE: &str = "system/memory-maintenance";
@@ -106,7 +109,7 @@ pub struct AgentSpec {
     /// Optional sampling temperature (0.0–2.0).
     #[serde(default)]
     pub temperature: Option<f32>,
-    /// Optional cap on the LLM response token count. Unset uses 4096.
+    /// Optional cap on the LLM response token count. Unset uses the provider default.
     #[serde(default)]
     pub max_tokens: Option<u32>,
     /// Number of complete user/assistant turns retained for this agent.
@@ -412,47 +415,6 @@ pub fn validate_cron_expression(raw: &str) -> Result<(), ApiError> {
     Cron::from_str(expr)
         .map_err(|error| ApiError::Validation(format!("invalid cron expression: {error}")))?;
     Ok(())
-}
-
-pub fn validate_timezone_name(raw: &str) -> Result<(), ApiError> {
-    let timezone = raw.trim();
-    if timezone.is_empty() {
-        return Err(ApiError::Validation("timezone must not be empty".into()));
-    }
-    if timezone.parse::<Tz>().is_ok() || parse_timezone_offset(timezone).is_some() {
-        return Ok(());
-    }
-    Err(ApiError::Validation(format!(
-        "invalid timezone: {timezone}"
-    )))
-}
-
-pub fn parse_timezone_offset(raw: &str) -> Option<i32> {
-    let trimmed = raw.trim();
-    let normalized = trimmed
-        .strip_prefix("UTC")
-        .or_else(|| trimmed.strip_prefix("GMT"))
-        .unwrap_or(trimmed);
-    if normalized == "Z" {
-        return Some(0);
-    }
-    let sign = if let Some(rest) = normalized.strip_prefix('+') {
-        (1, rest)
-    } else if let Some(rest) = normalized.strip_prefix('-') {
-        (-1, rest)
-    } else {
-        return None;
-    };
-    let (hours, minutes) = if let Some((hours, minutes)) = sign.1.split_once(':') {
-        (hours, minutes)
-    } else if sign.1.len() > 2 {
-        sign.1.split_at(sign.1.len() - 2)
-    } else {
-        (sign.1, "0")
-    };
-    let hours: i32 = hours.parse().ok()?;
-    let minutes: i32 = minutes.parse().ok()?;
-    Some(sign.0 * (hours * 3600 + minutes * 60))
 }
 
 impl AgentResource {

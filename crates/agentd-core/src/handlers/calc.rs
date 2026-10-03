@@ -13,29 +13,38 @@ use serde_json::Value;
 
 impl CapabilityEngine {
     pub(crate) async fn execute_calc_eval(&self, params: &Value) -> Result<Value> {
-        let expr = params
-            .get("expression")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("calc.eval requires params.expression"))?;
-        let trimmed = expr.trim();
-        if trimmed.is_empty() {
-            return Err(anyhow!("calc.eval: expression must not be empty"));
-        }
-        // meval handles arithmetic + math functions + pi/e. Errors are
-        // surfaced verbatim so the LLM sees a useful "unknown function
-        // 'fooBar' at position N" rather than a generic failure.
-        let result = meval::eval_str(trimmed)
-            .map_err(|e| anyhow!("calc.eval: invalid expression: {}", e))?;
-        if !result.is_finite() {
-            return Err(anyhow!(
-                "calc.eval: expression evaluated to non-finite value ({result})"
-            ));
-        }
+        let (trimmed, result) = evaluate(params)?;
         Ok(serde_json::json!({
             "expr": trimmed,
             "result": result,
         }))
     }
+}
+
+fn evaluate(params: &Value) -> Result<(&str, f64)> {
+    let expr = params
+        .get("expression")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("calc.eval requires params.expression"))?;
+    let trimmed = expr.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("calc.eval: expression must not be empty"));
+    }
+    // meval handles arithmetic + math functions + pi/e. Errors are
+    // surfaced verbatim so the LLM sees a useful "unknown function
+    // 'fooBar' at position N" rather than a generic failure.
+    let result =
+        meval::eval_str(trimmed).map_err(|e| anyhow!("calc.eval: invalid expression: {}", e))?;
+    if !result.is_finite() {
+        return Err(anyhow!(
+            "calc.eval: expression evaluated to non-finite value ({result})"
+        ));
+    }
+    Ok((trimmed, result))
+}
+
+pub(crate) fn validate_input(params: &Value) -> Result<()> {
+    evaluate(params).map(|_| ())
 }
 
 #[cfg(test)]
@@ -83,7 +92,7 @@ mod tests {
         );
 
         for (arguments, expected_error) in [
-            (json!({"expr":"1+1"}), "missing required field 'expression'"),
+            (json!({"expr":"1+1"}), "required property"),
             (json!({"expression":" "}), "expression must not be empty"),
             (json!({"expression":"1+"}), "invalid expression"),
             (json!({"expression":"1/0"}), "non-finite"),

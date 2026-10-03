@@ -38,7 +38,7 @@ pub(crate) async fn search_memory(
         let text = query
             .query
             .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("query is required"))?;
+            .ok_or_else(|| agentd_store::StoreError::Validation("query is required".into()))?;
         state
             .capabilities
             .search_memory(

@@ -32,6 +32,13 @@ name = "option-ext"
 version = "=0.2.0"
 allow = ["MPL-2.0"]
 
+# JSON Schema local-reference handling uses this no-attribution MIT variant.
+# Keep the exception tied to the dependency version reviewed in Cargo.lock.
+[[licenses.exceptions]]
+name = "borrow-or-share"
+version = "=0.2.4"
+allow = ["MIT-0"]
+
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"

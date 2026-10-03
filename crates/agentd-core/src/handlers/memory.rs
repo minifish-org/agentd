@@ -45,22 +45,35 @@ fn encode_list_cursor(tenant: &str, namespace: &str, after_id: &str) -> Result<S
     Ok(URL_SAFE_NO_PAD.encode(serde_json::to_vec(&cursor)?))
 }
 
-fn decode_list_cursor(cursor: &str, tenant: &str, namespace: &str) -> Result<String> {
+fn parse_list_cursor(raw: &str) -> Result<MemoryListCursor> {
     let bytes = URL_SAFE_NO_PAD
-        .decode(cursor.trim())
+        .decode(raw.trim())
         .map_err(|_| anyhow!("invalid memory_list cursor"))?;
     let cursor: MemoryListCursor =
         serde_json::from_slice(&bytes).map_err(|_| anyhow!("invalid memory_list cursor"))?;
-    if cursor.version != 1
-        || cursor.tenant != tenant
-        || cursor.namespace != namespace
-        || cursor.after_id.trim().is_empty()
-    {
+    if cursor.version != 1 || cursor.after_id.trim().is_empty() {
+        return Err(anyhow!("invalid memory_list cursor version or position"));
+    }
+    Ok(cursor)
+}
+
+fn decode_list_cursor(raw: &str, tenant: &str, namespace: &str) -> Result<String> {
+    let cursor = parse_list_cursor(raw)?;
+    if cursor.tenant != tenant || cursor.namespace != namespace {
         return Err(anyhow!(
             "memory_list cursor does not match the current tenant and namespace"
         ));
     }
     Ok(cursor.after_id)
+}
+
+pub(crate) fn validate_list_input(params: &Value) -> Result<()> {
+    params
+        .get("cursor")
+        .and_then(Value::as_str)
+        .map(parse_list_cursor)
+        .transpose()
+        .map(|_| ())
 }
 
 impl CapabilityEngine {
@@ -149,27 +162,14 @@ impl CapabilityEngine {
         params: &Value,
         run_id: Option<uuid::Uuid>,
     ) -> Result<Value> {
-        let text = required(params, "text")?;
-        if text.len() > agentd_store::MAX_MEMORY_TEXT_BYTES {
-            return Err(anyhow!(
-                "memory text exceeds {} UTF-8 bytes; store long content as an artifact",
-                agentd_store::MAX_MEMORY_TEXT_BYTES
-            ));
-        }
+        let (id, text, graph) = parse_put(params)?;
         let embedding = self.embed_passage(text).await?;
-        let graph = params
-            .get("graph")
-            .cloned()
-            .map(serde_json::from_value::<MemoryGraphInput>)
-            .transpose()
-            .map_err(|error| anyhow!("invalid memory graph: {error}"))?
-            .unwrap_or_default();
         let item = if let Some(run_id) = run_id {
             self.store
                 .put_memory_with_graph_for_run(
                     run_id,
                     namespace(params),
-                    required(params, "id")?,
+                    id,
                     text,
                     &embedding,
                     &graph,
@@ -177,14 +177,7 @@ impl CapabilityEngine {
                 .await?
         } else {
             self.store
-                .put_memory_with_graph(
-                    tenant,
-                    namespace(params),
-                    required(params, "id")?,
-                    text,
-                    &embedding,
-                    &graph,
-                )
+                .put_memory_with_graph(tenant, namespace(params), id, text, &embedding, &graph)
                 .await?
         };
         Ok(json!({"item":item}))
@@ -216,6 +209,30 @@ impl CapabilityEngine {
         };
         Ok(json!({"deleted":deleted}))
     }
+}
+
+fn parse_put(params: &Value) -> Result<(&str, &str, MemoryGraphInput)> {
+    let id = required(params, "id")?;
+    let text = required(params, "text")?;
+    if text.len() > agentd_store::MAX_MEMORY_TEXT_BYTES {
+        return Err(anyhow!(
+            "memory text exceeds {} UTF-8 bytes; store long content as an artifact",
+            agentd_store::MAX_MEMORY_TEXT_BYTES
+        ));
+    }
+    let graph = params
+        .get("graph")
+        .cloned()
+        .map(serde_json::from_value::<MemoryGraphInput>)
+        .transpose()
+        .map_err(|error| anyhow!("invalid memory graph: {error}"))?
+        .unwrap_or_default();
+    agentd_store::validate_memory_graph_input(&graph)?;
+    Ok((id, text, graph))
+}
+
+pub(crate) fn validate_input(params: &Value) -> Result<()> {
+    parse_put(params).map(|_| ())
 }
 
 #[cfg(test)]

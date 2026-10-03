@@ -139,7 +139,7 @@ pub(crate) async fn delete_tenant(
     State(state): State<AppState>,
     Path(tenant): Path<String>,
 ) -> impl IntoResponse {
-    json_result(state.store.delete_tenant(&tenant).await)
+    json_result(state.supervisor.delete_tenant(&state, &tenant).await)
 }
 
 pub(crate) async fn list_agents(
@@ -200,7 +200,7 @@ pub(crate) async fn put_agent(
         },
     };
     if let Err(error) = resource.validate() {
-        return error_response(error.to_string());
+        return error_response(error);
     }
     match state.store.apply_agent(&resource).await {
         Ok(()) => (
